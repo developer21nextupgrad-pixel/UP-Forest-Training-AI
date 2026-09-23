@@ -1,0 +1,81 @@
+"""Domain enums used by the database foundation."""
+from enum import StrEnum
+
+
+class UserRole(StrEnum):
+    ADMIN = "ADMIN"
+    INSTRUCTOR = "INSTRUCTOR"
+    STUDENT = "STUDENT"
+    
+    LEGAL_USER = "LEGAL_USER"
+    FIELD_OFFICER = "FIELD_OFFICER"
+
+
+class BookStatus(StrEnum):
+    UPLOADED = "UPLOADED"
+    PROCESSING = "PROCESSING"
+    READY = "READY"
+    PARTIAL = "PARTIAL"
+    FAILED = "FAILED"
+    ARCHIVED = "ARCHIVED"
+
+
+class ProcessingStatus(StrEnum):
+    UPLOADED = "UPLOADED"
+    QUEUED = "QUEUED"
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
+    OCR_PROCESSING = "OCR_PROCESSING"
+    TEXT_PROCESSING = "TEXT_PROCESSING"
+    CHUNKING = "CHUNKING"
+    EMBEDDING = "EMBEDDING"
+    READY = "READY"
+    PARTIAL = "PARTIAL"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    ARCHIVED = "ARCHIVED"
+
+
+class IngestionJobStatus(StrEnum):
+    QUEUED = "QUEUED"
+    PROCESSING = "PROCESSING"
+    COMPLETE = "COMPLETE"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class IngestionStage(StrEnum):
+    FILE_VALIDATION = "FILE_VALIDATION"
+    OCR_PROCESSING = "OCR_PROCESSING"
+    TEXT_CLEANING = "TEXT_CLEANING"
+    STRUCTURE_EXTRACTION = "STRUCTURE_EXTRACTION"
+    CHUNKING = "CHUNKING"
+    PERSIST_CHUNKS = "PERSIST_CHUNKS"
+    VECTOR_INDEXING = "VECTOR_INDEXING"
+    COMPLETE = "COMPLETE"
+
+
+class EnrollmentStatus(StrEnum):
+    ACTIVE = "ACTIVE"
+    COMPLETED = "COMPLETED"
+    SUSPENDED = "SUSPENDED"
+
+
+class ChatRole(StrEnum):
+    USER = "USER"
+    ASSISTANT = "ASSISTANT"
+    SYSTEM = "SYSTEM"
+    
+class ContentDomain(StrEnum):
+    TRAINING = "TRAINING"
+    FIELD = "FIELD"
+    LEGAL = "LEGAL"
+    
+class DocumentType(StrEnum):
+    ACT = "ACT"
+    RULE = "RULE"
+    ORDER = "ORDER"
+    CIRCULAR = "CIRCULAR"
+    SOP = "SOP"
+    JUDGMENT = "JUDGMENT"
+    MANUAL = "MANUAL"

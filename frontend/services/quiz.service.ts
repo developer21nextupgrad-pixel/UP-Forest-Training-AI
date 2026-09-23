@@ -1,0 +1,12 @@
+import {apiRequest} from "@/lib/api";
+export const getStudentQuizzes=()=>apiRequest<any[]>("/api/v1/student/quizzes");
+export const getStudentQuiz=(id:string)=>apiRequest<any>(`/api/v1/student/quizzes/${id}`);
+export const startAttempt=(id:string)=>apiRequest<any>(`/api/v1/student/quizzes/${id}/attempts`,{method:"POST"});
+export const submitAttempt=(id:string,answers:any[])=>apiRequest<any>(`/api/v1/student/attempts/${id}/submit`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({answers})});
+export const getAttempt=(id:string)=>apiRequest<any>(`/api/v1/student/attempts/${id}`);
+export const getQuizHistory=()=>apiRequest<any[]>("/api/v1/student/quiz-history");
+export const getManagedQuizzes=()=>apiRequest<any[]>("/api/v1/quizzes");
+export const createQuiz=(data:any)=>apiRequest<any>("/api/v1/quizzes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});
+export const addQuestion=(id:string,data:any)=>apiRequest<any>(`/api/v1/quizzes/${id}/questions`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});
+export const publishQuiz=(id:string)=>apiRequest<any>(`/api/v1/quizzes/${id}/publish`,{method:"POST"});
+export const generateQuiz=(data:any)=>apiRequest<any>("/api/v1/quizzes/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});
