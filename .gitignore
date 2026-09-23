@@ -35,3 +35,5 @@ Thumbs.db
 **/*.egg-info/
 
 /pgvector/
+# Database backup
+*.dump
