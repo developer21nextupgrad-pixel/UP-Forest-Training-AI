@@ -33,3 +33,5 @@ Thumbs.db
 
 # Python build metadata
 **/*.egg-info/
+
+/pgvector/
