@@ -161,6 +161,53 @@ export default function TutorPage() {
   }
 
   // =========================================================
+  // CLEAN ALL CHATS
+  // =========================================================
+
+  async function cleanAllChats() {
+    if (loading || sessions.length === 0) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      "Are you sure you want to clear all tutor chats? This cannot be undone."
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      setError("");
+      setLoading(true);
+
+      // Delete each session using the existing backend delete endpoint.
+      for (const session of sessions) {
+        const response = await apiRequest<any>(
+          `/api/v1/tutor/sessions/${session.id}`,
+          { method: "DELETE" }
+        );
+
+        if (!response.success) {
+          throw new Error(response.message || "Failed to delete tutor chat.");
+        }
+      }
+
+      setSessions([]);
+      setSessionId(undefined);
+      setMessages([]);
+      setInput("");
+      setScope({});
+    } catch (err) {
+      console.error("Failed to clean tutor chats:", err);
+      setError("Failed to clear all tutor chats.");
+      await loadSessions();
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // =========================================================
   // CREATE NEW CHAT
   // =========================================================
 
@@ -683,14 +730,27 @@ export default function TutorPage() {
               </p>
             </div>
 
-            <button
-              type="button"
-              onClick={() => void newChat()}
-              disabled={loading}
-              className="rounded-md border px-3 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50"
-            >
-              New Chat
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void newChat()}
+                disabled={loading}
+                className="rounded-md border px-3 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50"
+              >
+                New Chat
+              </button>
+
+              {sessions.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => void cleanAllChats()}
+                  disabled={loading}
+                  className="rounded-md border border-red-300 px-3 py-2 text-sm font-medium text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {loading ? "Cleaning..." : "Clean"}
+                </button>
+              )}
+            </div>
 
           </div>
 
