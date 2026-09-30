@@ -19,12 +19,21 @@ _LOCALHOST_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 
 def configure_cors(app: FastAPI, settings: Settings) -> None:
     app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.cors_origin_list,
-        allow_origin_regex=(
-            _LOCALHOST_ORIGIN_REGEX if settings.environment == "local" else None
-        ),
-        allow_credentials=True,
-        allow_methods=["GET", "POST"],
-        allow_headers=["*"],
-    )
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_origin_regex=(
+        _LOCALHOST_ORIGIN_REGEX
+        if settings.environment == "local"
+        else r"^https://up-forest-training-ai\.vercel\.app$"
+    ),
+    allow_credentials=True,
+    allow_methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+    ],
+    allow_headers=["*"],
+)
