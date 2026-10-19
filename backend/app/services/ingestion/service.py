@@ -10,7 +10,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import Settings
+from app.core.exceptions import MistralRateLimitError
 from app.models import (Book, Chapter, Document, DocumentChunk, DocumentIngestionJob, DocumentPage, DocumentSection, DocumentVersion, IngestionJobStatus, IngestionStage, ProcessingStatus)
 from app.services import mistral_ocr
 from .embedding import MistralEmbeddingProvider
@@ -146,6 +146,31 @@ class IngestionService:
         except Exception as exc:
             logger.exception("Ingestion failed job_id=%s",job_id)
             await self.session.rollback()
+            if isinstance(exc, MistralRateLimitError):
+                job = await self.session.get(
+                    DocumentIngestionJob,
+                    job_id,
+                )
+
+                if job:
+                    job.error_message = str(exc)[:2000]
+                    job.last_error_code = type(exc).__name__
+                    job.lease_expires_at = None
+                    job.status = IngestionJobStatus.FAILED
+                    job.completed_at = datetime.now(timezone.utc)
+
+                    if version:
+                        version.processing_status = "FAILED"
+                        version.error_message = str(exc)[:2000]
+
+                    if document:
+                        document.ocr_status = ProcessingStatus.FAILED
+                        document.processing_status = ProcessingStatus.FAILED
+
+                    await self.session.commit()
+
+                return
+            
             job=await self.session.get(DocumentIngestionJob,job_id); document=await self.session.get(Document,job.document_id) if job else None; version=await self.session.get(DocumentVersion,job.document_version_id) if job and job.document_version_id else None
             if job:
                 job.error_message=str(exc)[:2000]; job.last_error_code=type(exc).__name__; job.lease_expires_at=None

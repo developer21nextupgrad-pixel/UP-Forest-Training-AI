@@ -6,12 +6,14 @@ without implementing those workflows.
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+import uuid
+from datetime import date, datetime, time
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import (
     Boolean,
+    BigInteger,
     Date,
     DateTime,
     Enum,
@@ -21,12 +23,15 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    Time,
     UniqueConstraint,
     Uuid,
     text,
+    func,
 )
 
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.dialects.postgresql import UUID
 
 from app.db.vector import Vector
 
@@ -673,5 +678,722 @@ __all__ = [
     "Document", "DocumentVersion", "DocumentPage", "DocumentChunk", "DocumentIngestionJob", "Enrollment",
     "LearningProgress", "LearningHistory", "ChatSession", "ChatMessage",
     "Quiz", "Question", "QuizOption", "QuizAttempt", "QuizAnswer", "QuizGenerationJob",
-    "WeakTopic", "ReviewSchedule", "AuditLog", "RefreshTokenSession", "PasswordResetToken",
+    "WeakTopic", "ReviewSchedule", "AuditLog", "RefreshTokenSession", "PasswordResetToken","FieldPatrolReport","IncidentReport","OffenceSeizureReport",
 ]
+
+class FieldPatrolReport(Base):
+    """Saved patrol report created by a Field Officer."""
+
+    __tablename__ = "field_patrol_reports"
+
+    id: Mapped[UUID] = mapped_column(
+    Uuid(as_uuid=True),
+    primary_key=True,
+    default=uuid4,
+)
+
+    officer_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id"),
+        nullable=False,
+        index=True,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="DRAFT",
+        index=True,
+    )
+
+    patrol_date: Mapped[date | None] = mapped_column(
+        Date,
+        nullable=True,
+    )
+
+    beat: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    range_name: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    division: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    start_time: Mapped[time | None] = mapped_column(
+        Time,
+        nullable=True,
+    )
+
+    end_time: Mapped[time | None] = mapped_column(
+        Time,
+        nullable=True,
+    )
+
+    location: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    team_members: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+    )
+
+    purpose: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    observations: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    wildlife_sighting: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    illegal_activity: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    action_taken: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    incident_details: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    additional_remarks: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    source_text: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    ai_confidence: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+    )
+    
+    review_status: Mapped[str] = mapped_column(
+    String(30),
+    nullable=False,
+    default="PENDING",
+    index=True,
+)
+
+    review_comment: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    reviewed_by: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    
+    submitted_at: Mapped[datetime | None] = mapped_column(
+    DateTime(timezone=True),
+    nullable=True,
+)
+
+class IncidentReport(Base):
+    """Incident report created by a Field Officer."""
+
+    __tablename__ = "incident_reports"
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+    )
+
+    officer_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="DRAFT",
+        index=True,
+    )
+
+    incident_date: Mapped[date | None] = mapped_column(
+        Date,
+        nullable=True,
+    )
+
+    incident_time: Mapped[time | None] = mapped_column(
+        Time,
+        nullable=True,
+    )
+
+    division: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    range_name: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    beat: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    location: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    incident_type: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    reported_by: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    persons_involved: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+    )
+
+    wildlife_involved: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    incident_description: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    immediate_action_taken: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    authorities_informed: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    injury_or_damage: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    evidence_details: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    additional_remarks: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    source_text: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    review_status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="PENDING",
+        index=True,
+    )
+
+    review_comment: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    reviewed_by: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    submitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )  
+
+class OffenceSeizureReport(Base):
+    __tablename__ = "offence_seizure_reports"
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+    )
+
+    officer_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="DRAFT",
+        index=True,
+    )
+
+    # ---------------------------------------------------------
+    # Offence details
+    # ---------------------------------------------------------
+
+    offence_date: Mapped[date | None] = mapped_column(
+        Date,
+        nullable=True,
+    )
+
+    offence_time: Mapped[time | None] = mapped_column(
+        Time,
+        nullable=True,
+    )
+
+    division: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    range_name: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    beat: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    location: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    offence_type: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    applicable_law: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    applicable_section: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    # ---------------------------------------------------------
+    # Persons / accused
+    # ---------------------------------------------------------
+
+    persons_involved: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+    )
+
+    # ---------------------------------------------------------
+    # Seizure details
+    # ---------------------------------------------------------
+
+    seized_material: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+    )
+
+    seizure_location: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    seizure_date: Mapped[date | None] = mapped_column(
+        Date,
+        nullable=True,
+    )
+
+    seizure_time: Mapped[time | None] = mapped_column(
+        Time,
+        nullable=True,
+    )
+
+    vehicle_details: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    vehicle_registration_number: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    # ---------------------------------------------------------
+    # Evidence / witnesses
+    # ---------------------------------------------------------
+
+    evidence_details: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    witnesses: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+    )
+
+    # ---------------------------------------------------------
+    # Action / case details
+    # ---------------------------------------------------------
+
+    action_taken: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    authorities_informed: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    case_reference_number: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    fir_number: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    incident_reference_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "incident_reports.id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        index=True,
+    )
+
+    # ---------------------------------------------------------
+    # Description / AI source
+    # ---------------------------------------------------------
+
+    description: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    additional_remarks: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    source_text: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    ai_confidence: Mapped[float | None] = mapped_column(
+        nullable=True,
+    )
+
+    # ---------------------------------------------------------
+    # Review
+    # ---------------------------------------------------------
+
+    review_status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="PENDING",
+        index=True,
+    )
+
+    review_comment: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    reviewed_by: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    # ---------------------------------------------------------
+    # Timestamps
+    # ---------------------------------------------------------
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    submitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )  
+    
+class Evidence(Base):
+    __tablename__ = "evidence"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+
+    report_type: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        index=True,
+    )
+
+    report_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=False,
+        index=True,
+    )
+
+    officer_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    file_name: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    storage_key: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        unique=True,
+    )
+
+    file_type: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+    )
+
+    file_size: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+    )
+
+    mime_type: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+
+    description: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    uploaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )    
+
+class DailyDiary(Base):
+    """Daily diary entry created by a Field Officer."""
+
+    __tablename__ = "daily_diaries"
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+    )
+
+    officer_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="DRAFT",
+        index=True,
+    )
+
+    diary_date: Mapped[date | None] = mapped_column(
+        Date,
+        nullable=True,
+    )
+
+    subject: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    description: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    location: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    activities: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+    )
+
+    observations: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    additional_remarks: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    source_text: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    review_status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="PENDING",
+        index=True,
+    )
+
+    review_comment: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    reviewed_by: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    submitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )

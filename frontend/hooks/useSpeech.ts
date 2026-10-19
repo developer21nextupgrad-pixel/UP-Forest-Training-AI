@@ -33,7 +33,10 @@ function isTypingTarget(target: EventTarget | null): boolean {
   );
 }
 
-export function useSpeech() {
+export interface UseSpeechOptions {
+  onTranscriptReady?: (transcript: string, language: string | null) => void;
+}
+export function useSpeech(options: UseSpeechOptions = {}) {
   const [permission, setPermission] = React.useState<MicrophonePermission>("unknown");
   const [connectionState, setConnectionState] =
     React.useState<SpeechConnectionState>("disconnected");
@@ -151,11 +154,17 @@ export function useSpeech() {
         setTranscript((prev) => prev + payload.chunk);
         setConnectionState((s) => (s === "stopped" ? s : "streaming"));
       } else if ("refined_transcript" in payload) {
-        setTranscript(payload.refined_transcript);
+        const refinedTranscript = payload.refined_transcript.trim();
+
+        setTranscript(refinedTranscript);
         setLanguage(payload.language);
         setIsRefining(false);
         setWasRefined(true);
         toast.success("Transcript refined for accuracy.");
+
+        if (refinedTranscript && options.onTranscriptReady) {
+          options.onTranscriptReady(refinedTranscript, payload.language);
+        }
       } else if ("status" in payload && payload.status === "refining") {
         setIsRefining(true);
       } else if ("model" in payload) {

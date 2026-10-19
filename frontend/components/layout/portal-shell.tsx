@@ -16,6 +16,11 @@ import {
   Users,
   X,
   GraduationCap,
+  AlertTriangle,
+  Bot,
+  ClipboardList,
+  BookOpen,
+  ScanSearch,
 } from "lucide-react";
 import { useState } from "react";
 
@@ -60,6 +65,26 @@ const adminNav = [
     label: "Reports & Analytics",
     icon: BarChart3,
   },
+  {
+    href: "/admin/patrol-reports",
+    label: "Patrol Reports",
+    icon: ClipboardCheck,
+  },
+  {
+    href: "/admin/daily-diaries",
+    label: "Daily Diaries",
+    icon: FileText,
+  },
+  {
+    href: "/admin/incident-reports",
+    label: "Incident Reports",
+    icon: AlertTriangle,
+  },
+  {
+  href: "/admin/offence-seizure-reports",
+  label: "Offence & Seizure Reports",
+  icon: FileText,
+},
   { href: "/settings", label: "System Settings", icon: Settings },
 ];
 
@@ -85,6 +110,20 @@ const instructorNav = [
 ];
 
 // ============================================================
+// FIELD OFFICER NAVIGATION
+// ============================================================
+
+const fieldOfficerNav = [
+  { href: "/field", label: "Dashboard", icon: Home },
+  { href: "/field/assistant", label: "AI Field Assistant", icon: Bot },
+  { href: "/field/patrol", label: "Patrol Reports", icon: ClipboardList },
+  { href: "/field/daily-diary", label: "Daily Diary", icon: BookOpen },
+  { href: "/field/incidents", label: "Incident Reports", icon: AlertTriangle },
+  { href: "/field/offence-seizure", label: "Offence & Seizure", icon: FileText },
+  { href: "/field/species", label: "Species Identification", icon: ScanSearch },
+];
+
+// ============================================================
 // ROLE NAVIGATION
 // ============================================================
 
@@ -95,6 +134,10 @@ function navigationForRole(role?: string) {
 
   if (role === "INSTRUCTOR") {
     return instructorNav;
+  }
+
+  if (role === "FIELD_OFFICER") {
+    return fieldOfficerNav;
   }
 
   return studentNav;
@@ -119,7 +162,8 @@ export function PortalShell({
   const hasSidebar =
     pathname.startsWith("/student") ||
     pathname.startsWith("/admin") ||
-    pathname.startsWith("/instructor");
+    pathname.startsWith("/instructor") ||
+    pathname.startsWith("/field");
 
   const nav = navigationForRole(user?.role);
 
@@ -169,7 +213,8 @@ export function PortalShell({
           </div>
 
           {/* NAVIGATION */}
-          <div className="px-4 py-5">
+          {/* NAVIGATION */}
+          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5">
             <p className="mb-3 px-3 text-[10px] font-semibold uppercase tracking-[0.18em] text-emerald-100/50">
               Workspace
             </p>

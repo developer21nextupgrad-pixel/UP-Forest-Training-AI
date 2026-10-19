@@ -95,7 +95,7 @@ function failureForStatus(status: number, body: any): ApiResponse<never> {
 
 export async function apiRequest<T>(
   path: string,
-  { timeoutMs = 30_000, signal, ...init }: ApiRequestOptions = {},
+  { timeoutMs = 120_000, signal, ...init }: ApiRequestOptions = {},
   _retry = true,
 ): Promise<ApiResponse<T>> {
   const controller = new AbortController();

@@ -12,5 +12,18 @@ class MistralServiceError(Exception):
     """Raised when a Mistral API call fails after validation has already passed."""
 
 
+class MistralRateLimitError(MistralServiceError):
+    """Raised when Mistral rejects a request because of rate limiting."""
+
+    def __init__(
+        self,
+        message: str = "Mistral API rate limit exceeded.",
+        *,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class MistralTimeoutError(MistralServiceError):
     """Raised when a Mistral call exceeds the endpoint's timeout budget."""

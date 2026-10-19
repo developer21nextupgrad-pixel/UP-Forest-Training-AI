@@ -9,16 +9,21 @@ from functools import lru_cache
 
 
 class RateLimiter:
-    def __init__(self, *, max_requests: int, window_seconds: float) -> None:
+    def __init__(
+        self,
+        *,
+        max_requests: int,
+        window_seconds: float,
+    ) -> None:
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self._hits: dict[str, deque[float]] = defaultdict(deque)
 
-    def allow(self, key: str) -> bool:
+    def allow(self, *, key: str) -> bool:
         now = time.monotonic()
         hits = self._hits[key]
 
-        while hits and now - hits[0] > self.window_seconds:
+        while hits and now - hits[0] >= self.window_seconds:
             hits.popleft()
 
         if len(hits) >= self.max_requests:
@@ -29,41 +34,90 @@ class RateLimiter:
 
 
 class PageRateLimiter:
-    """Sliding-window limiter for APIs whose quota is measured in pages."""
+    """
+    O(1) amortized sliding-window page rate limiter.
 
-    def __init__(self, *, max_pages: int, window_seconds: float = 60.0) -> None:
+    Mistral OCR limit:
+        625 pages/minute
+
+    Application safety limit:
+        500 pages/minute
+    """
+
+    def __init__(
+        self,
+        *,
+        max_pages: int = 500,
+        window_seconds: float = 60.0,
+    ) -> None:
+        if max_pages <= 0:
+            raise ValueError("max_pages must be > 0")
+
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be > 0")
+
         self.max_pages = max_pages
         self.window_seconds = window_seconds
+
+        # (timestamp, pages)
         self._hits: deque[tuple[float, int]] = deque()
+
+        # O(1) replacement for:
+        # sum(count for _, count in self._hits)
+        self._used_pages = 0
+
         self._lock = asyncio.Lock()
 
+    def _remove_expired(self, now: float) -> None:
+        """Remove expired entries in amortized O(1)."""
+
+        while self._hits:
+            timestamp, pages = self._hits[0]
+
+            if now - timestamp < self.window_seconds:
+                break
+
+            self._hits.popleft()
+            self._used_pages -= pages
+
     async def acquire(self, pages: int) -> None:
-        """Wait until `pages` can be sent without exceeding the page quota."""
+        """
+        Wait until `pages` can be sent without exceeding the quota.
+        """
 
         pages = max(1, pages)
+
+        if pages > self.max_pages:
+            raise ValueError(
+                f"Batch contains {pages} pages, "
+                f"but rate limiter maximum is {self.max_pages}."
+            )
 
         while True:
             async with self._lock:
                 now = time.monotonic()
 
-                while (
-                    self._hits
-                    and now - self._hits[0][0] >= self.window_seconds
-                ):
-                    self._hits.popleft()
+                self._remove_expired(now)
 
-                used_pages = sum(count for _, count in self._hits)
-
-                if used_pages + pages <= self.max_pages:
+                # O(1)
+                if self._used_pages + pages <= self.max_pages:
                     self._hits.append((now, pages))
+                    self._used_pages += pages
                     return
 
-                wait_for = self.window_seconds - (now - self._hits[0][0])
+                oldest_timestamp = self._hits[0][0]
 
-            await asyncio.sleep(max(0.1, wait_for))
+                wait_for = (
+                    self.window_seconds
+                    - (now - oldest_timestamp)
+                )
+
+            await asyncio.sleep(
+                max(0.05, wait_for)
+            )
 
 
-@lru_cache
+@lru_cache(maxsize=1)
 def get_rate_limiter() -> RateLimiter:
     from app.core.config import get_settings
 
@@ -75,11 +129,15 @@ def get_rate_limiter() -> RateLimiter:
     )
 
 
-@lru_cache
+@lru_cache(maxsize=1)
 def get_ocr_page_rate_limiter() -> PageRateLimiter:
-    """Mistral OCR provider quota: 60 pages/minute."""
+    """
+    Mistral OCR:
+        Provider limit = 625 pages/minute
+        Application limit = 500 pages/minute
+    """
 
     return PageRateLimiter(
-        max_pages=60,
+        max_pages=500,
         window_seconds=60.0,
     )
