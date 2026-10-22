@@ -47,7 +47,7 @@ async def transcribe_audio_file(
     request: Request, audio: UploadFile, settings: SettingsDep
 ) -> SpeechTranscribeSuccessResponse:
     client_ip = request.client.host if request.client else "unknown"
-    if not get_rate_limiter().allow(f"speech:{client_ip}"):
+    if not get_rate_limiter().allow(key=f"speech:{client_ip}"):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Rate limit exceeded")
 
     content = await audio.read()
@@ -130,7 +130,7 @@ async def live_transcription(websocket: WebSocket) -> None:
     await websocket.accept()
 
     client_ip = websocket.client.host if websocket.client else "unknown"
-    if not get_rate_limiter().allow(f"speech:{client_ip}"):
+    if not get_rate_limiter().allow(key=f"speech:{client_ip}"):
         await websocket.send_json({"error": "Rate limit exceeded"})
         await websocket.close()
         return
