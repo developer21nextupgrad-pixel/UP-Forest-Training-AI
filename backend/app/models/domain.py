@@ -71,6 +71,38 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
+class WhatsAppOfficerLink(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "whatsapp_officer_links"
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_whatsapp_officer_user"),
+        UniqueConstraint("phone_number", name="uq_whatsapp_officer_phone"),
+        UniqueConstraint("pairing_code_hash", name="uq_whatsapp_pairing_code_hash"),
+    )
+
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    phone_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    pairing_code_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    pairing_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    paired_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class WhatsAppInboundMessage(TimestampMixin, Base):
+    __tablename__ = "whatsapp_inbound_messages"
+
+    provider_message_id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    sender_phone: Mapped[str] = mapped_column(String(20), nullable=False)
+    message_text: Mapped[str] = mapped_column(Text, nullable=False)
+    reply_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="RECEIVED", nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class StudentProfile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "student_profiles"
     __table_args__ = (UniqueConstraint("user_id", name="uq_student_profile_user"),)
