@@ -10,22 +10,23 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from app.api import (
+    admin_users,
+    analytics,
     auth,
     books,
     documents,
+    field,
     health,
+    legal,
     ocr,
+    progress,
+    quiz,
     rag,
     speech,
-    tutor,
     student,
-    quiz,
-    progress,
-    analytics,
     subjects,
-    admin_users,
-    legal,
-    field,
+    tutor,
+    whatsapp,
 )
 from app.core.config import get_settings
 from app.core.constants import API_V1_PREFIX, APP_VERSION
@@ -88,6 +89,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_users.router, prefix=API_V1_PREFIX)
     app.include_router(legal.router, prefix=API_V1_PREFIX)
     app.include_router(field.router, prefix=API_V1_PREFIX)
+    app.include_router(whatsapp.router, prefix=API_V1_PREFIX)
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
