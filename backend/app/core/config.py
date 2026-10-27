@@ -11,7 +11,7 @@ from functools import lru_cache
 from typing import Annotated, Literal
 
 from fastapi import Depends
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -96,6 +96,18 @@ class Settings(BaseSettings):
     openrouter_api_key: str = Field(default="")
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_chat_model: str = "mistralai/mistral-small-3.2-24b-instruct"
+    whatsapp_access_token: str = ""
+    whatsapp_phone_number_id: str = ""
+    whatsapp_verify_token: str = ""
+    whatsapp_app_secret: str = ""
+    whatsapp_graph_api_version: str = "v23.0"
+    whatsapp_business_number: str = ""
+
+    @field_validator("whatsapp_verify_token", "whatsapp_app_secret", mode="before")
+    @classmethod
+    def normalize_whatsapp_webhook_secrets(cls, value: str) -> str:
+        return value.strip()
+
     # Lower = words appear sooner but with a bit less context to correct
     # itself; Mistral supports down to ~200ms. 250ms favors a "quick" feel
     # (PRD's core philosophy — never feel frozen) without being twitchy.
@@ -256,6 +268,20 @@ class Settings(BaseSettings):
     @property
     def is_mistral_configured(self) -> bool:
         return bool(self.mistral_api_key)
+
+    @property
+    def is_whatsapp_configured(self) -> bool:
+        return bool(
+            self.whatsapp_access_token
+            and self.whatsapp_phone_number_id
+            and self.whatsapp_verify_token
+            and self.whatsapp_app_secret
+            and self.whatsapp_business_number
+        )
+
+    @property
+    def is_whatsapp_webhook_configured(self) -> bool:
+        return bool(self.whatsapp_verify_token and self.whatsapp_app_secret)
 
 
 @lru_cache
