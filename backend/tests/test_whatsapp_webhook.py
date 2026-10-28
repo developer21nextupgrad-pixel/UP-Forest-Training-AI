@@ -2,11 +2,13 @@ import hashlib
 import hmac
 import json
 import logging
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings, get_settings
+from app.db.session import get_db_session
 from app.main import create_app
 
 VERIFY_TOKEN = "test-verify-token"
@@ -18,9 +20,17 @@ def client():
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
         _env_file=None,
+        whatsapp_access_token="test-access-token",
+        whatsapp_phone_number_id="test-phone-number-id",
         whatsapp_verify_token=VERIFY_TOKEN,
         whatsapp_app_secret=APP_SECRET,
+        whatsapp_business_number="+15550000000",
     )
+
+    async def fake_db_session():
+        yield None
+
+    app.dependency_overrides[get_db_session] = fake_db_session
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
@@ -79,10 +89,11 @@ def test_webhook_rejects_invalid_signature(client):
     assert response.status_code == 401
 
 
-def test_valid_webhook_is_acknowledged_without_processing_business_actions(
+def test_valid_incoming_message_reaches_assistant_without_logging_personal_data(
     client, monkeypatch, caplog
 ):
     caplog.set_level(logging.INFO)
+    processed = AsyncMock()
     payload = {
         "object": "whatsapp_business_account",
         "entry": [
@@ -92,9 +103,15 @@ def test_valid_webhook_is_acknowledged_without_processing_business_actions(
                     {
                         "field": "messages",
                         "value": {
+                            "metadata": {
+                                "phone_number_id": "test-phone-number-id",
+                                "display_phone_number": "+15550000000",
+                            },
                             "messages": [
                                 {
+                                    "id": "wamid.incoming-test",
                                     "from": "15551234567",
+                                    "type": "text",
                                     "text": {"body": "PRIVATE MESSAGE BODY"},
                                 }
                             ]
@@ -106,15 +123,7 @@ def test_valid_webhook_is_acknowledged_without_processing_business_actions(
     }
     body = json.dumps(payload, separators=(",", ":")).encode()
 
-    def business_action_must_not_run(*_args, **_kwargs):
-        raise AssertionError("Incoming webhook must not trigger business actions.")
-
-    monkeypatch.setattr(
-        "app.api.whatsapp._process_message", business_action_must_not_run
-    )
-    monkeypatch.setattr(
-        "app.api.whatsapp.send_whatsapp_text", business_action_must_not_run
-    )
+    monkeypatch.setattr("app.api.whatsapp._process_message", processed)
 
     response = client.post(
         "/api/v1/whatsapp/webhook",
@@ -124,10 +133,65 @@ def test_valid_webhook_is_acknowledged_without_processing_business_actions(
 
     assert response.status_code == 200
     assert response.json() == {"success": True}
+    processed.assert_awaited_once()
+    message, settings, session = processed.await_args.args
+    assert message == {
+        "id": "wamid.incoming-test",
+        "phone": "15551234567",
+        "text": "PRIVATE MESSAGE BODY",
+        "type": "text",
+    }
+    assert settings.whatsapp_phone_number_id == "test-phone-number-id"
+    assert session is None
     assert "PRIVATE MESSAGE BODY" not in caplog.text
     assert "15551234567" not in caplog.text
     assert "object=whatsapp_business_account entries=1 changes=1" in caplog.text
     assert "messages=1 statuses=0" in caplog.text
+
+
+def test_status_only_webhook_is_acknowledged_without_assistant_processing(
+    client, monkeypatch, caplog
+):
+    caplog.set_level(logging.INFO)
+    process_message = AsyncMock()
+    monkeypatch.setattr("app.api.whatsapp._process_message", process_message)
+    payload = {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "id": "business-account-id",
+                "changes": [
+                    {
+                        "field": "messages",
+                        "value": {
+                            "metadata": {
+                                "phone_number_id": "test-phone-number-id",
+                            },
+                            "statuses": [
+                                {
+                                    "id": "wamid.delivery-test",
+                                    "status": "delivered",
+                                    "recipient_id": "15551234567",
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode()
+
+    response = client.post(
+        "/api/v1/whatsapp/webhook",
+        content=body,
+        headers={"X-Hub-Signature-256": _signature(body)},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"success": True}
+    process_message.assert_not_awaited()
+    assert "messages=0 statuses=1" in caplog.text
 
 
 def test_webhook_rejects_signed_non_whatsapp_payload(client):

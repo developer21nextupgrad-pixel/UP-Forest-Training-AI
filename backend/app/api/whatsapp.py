@@ -9,7 +9,7 @@ import logging
 import re
 import secrets
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
 from fastapi import (
@@ -443,6 +443,7 @@ async def verify_meta_webhook(
 async def receive_meta_webhook(
     request: Request,
     settings: SettingsDep,
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     signature: str | None = Header(default=None, alias="X-Hub-Signature-256"),
 ) -> dict[str, bool]:
     if not settings.is_whatsapp_webhook_configured:
@@ -519,6 +520,15 @@ async def receive_meta_webhook(
                     )
                 message_count += len(messages)
                 status_count += len(statuses)
+
+    if message_count:
+        if not settings.is_whatsapp_configured:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="WhatsApp assistant is not configured.",
+            )
+        for message in _extract_messages(payload, settings.whatsapp_phone_number_id):
+            await _process_message(message, settings, session)
 
     logger.info(
         "Accepted WhatsApp webhook event object=%s entries=%d changes=%d "
