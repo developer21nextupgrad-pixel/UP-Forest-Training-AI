@@ -81,6 +81,7 @@ class PatrolReportSaveRequest(PatrolReportFields):
         ge=0.0,
         le=1.0,
     )
+    client_operation_id: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class PatrolReportSaveResponse(BaseModel):
@@ -218,6 +219,7 @@ class IncidentReportSaveRequest(IncidentReportFields):
         default=None,
         max_length=12000,
     )
+    client_operation_id: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class IncidentReportSaveResponse(BaseModel):
@@ -310,6 +312,11 @@ class DailyDiarySaveRequest(DailyDiaryFields):
     source_text: str | None = Field(
         default=None,
         max_length=12000,
+    )
+    client_operation_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
     )
 
 
@@ -421,6 +428,7 @@ class OffenceSeizureReportExtractResponse(BaseModel):
 
 class OffenceSeizureReportCreate(BaseModel):
     fields: OffenceSeizureReportFields
+    client_operation_id: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class OffenceSeizureReportUpdate(BaseModel):

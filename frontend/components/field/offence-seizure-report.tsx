@@ -12,11 +12,24 @@ import {
     Trash2,
     Upload,
 } from "lucide-react";
-import { useState,useEffect } from "react";
+import { useState,useEffect,useRef } from "react";
 import { toast } from "sonner";
 
 import { apiRequest, apiUrl } from "@/lib/api";
 import { getAccessToken } from "@/lib/auth";
+import {
+    createFieldLocalId,
+    enqueueOfflineEvidenceUpload,
+    enqueueOfflineFieldOperation,
+    fieldCreateOperationId,
+    fieldSyncableFailure,
+    getOfflineFormRecord,
+    loadOfflineFormDraft,
+    saveOfflineFormDraft,
+    useOfflineFieldForm,
+    type OfflineFieldRecord,
+} from "@/lib/offline-field-forms";
+import { OfflineFieldFormControls } from "./offline-field-form-controls";
 
 type JsonItem = Record<string, unknown>;
 
@@ -173,6 +186,9 @@ function normaliseFields(
 }
 
 export function OffenceSeizureReport({ onClose }: Props) {
+    const offline = useOfflineFieldForm("OFFENCE_SEIZURE");
+    const localId = useRef("");
+    const previousOwnerId = useRef<string | null>(null);
     const [fields, setFields] =
         useState<OffenceSeizureFields>(emptyFields);
 
@@ -184,11 +200,100 @@ export function OffenceSeizureReport({ onClose }: Props) {
     const [witnessesText, setWitnessesText] = useState("[]");
 
     const [reportId, setReportId] = useState<string | null>(null);
+    const [queuedCreate, setQueuedCreate] = useState(false);
+    const [offlineDraftRestored, setOfflineDraftRestored] = useState(false);
+    const [hasLocalEditorDraft, setHasLocalEditorDraft] = useState(false);
 
-    
     useEffect(() => {
-        const savedId = localStorage.getItem("offenceSeizureReportId");
+        if (!localId.current) localId.current = createFieldLocalId();
+    }, []);
 
+    useEffect(() => {
+        if (previousOwnerId.current !== offline.ownerId) {
+            previousOwnerId.current = offline.ownerId;
+            setFields(emptyFields);
+            setReportText("");
+            setReportId(null);
+            setPersonsText("[]");
+            setSeizedMaterialText("[]");
+            setWitnessesText("[]");
+            setQueuedCreate(false);
+            localId.current = offline.ownerId ? createFieldLocalId() : "";
+        }
+        setOfflineDraftRestored(false);
+        setHasLocalEditorDraft(false);
+        if (!offline.ownerId) return;
+        let cancelled = false;
+        void loadOfflineFormDraft<Record<string, unknown>>(offline.ownerId, "OFFENCE_SEIZURE", "active")
+            .then((draft) => {
+                if (cancelled || !draft) return;
+                setHasLocalEditorDraft(true);
+                const snapshot = draft.snapshot;
+                if (typeof snapshot.localId === "string") localId.current = snapshot.localId;
+                if (snapshot.fields && typeof snapshot.fields === "object") {
+                    const restoredFields = snapshot.fields as OffenceSeizureFields;
+                    setFields(restoredFields);
+                    setPersonsText(formatJson(restoredFields.persons_involved ?? []));
+                    setSeizedMaterialText(formatJson(restoredFields.seized_material ?? []));
+                    setWitnessesText(formatJson(restoredFields.witnesses ?? []));
+                }
+                if (typeof snapshot.reportText === "string") setReportText(snapshot.reportText);
+                if (typeof snapshot.reportId === "string") setReportId(snapshot.reportId);
+                setQueuedCreate(snapshot.queuedCreate === true);
+                toast.info("Restored your locally saved Offence & Seizure draft.");
+            })
+            .catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Unable to restore the local Offence & Seizure draft."))
+            .finally(() => { if (!cancelled) setOfflineDraftRestored(true); });
+        return () => { cancelled = true; };
+    }, [offline.ownerId]);
+
+    useEffect(() => {
+        if (!offline.ownerId || !offlineDraftRestored || !localId.current) return;
+        void saveOfflineFormDraft(offline.ownerId, "OFFENCE_SEIZURE", "active", {
+            localId: localId.current,
+            fields: fields as unknown as Record<string, unknown>,
+            reportText,
+            personsText,
+            seizedMaterialText,
+            witnessesText,
+            reportId,
+            queuedCreate,
+        }).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Unable to save the local Offence & Seizure draft."));
+    }, [fields, offline.ownerId, offlineDraftRestored, personsText, queuedCreate, reportId, reportText, seizedMaterialText, witnessesText]);
+
+    useEffect(() => {
+        if (!offline.ownerId || !localId.current) return;
+        const refreshRecord = () => {
+            void getOfflineFormRecord(offline.ownerId!, "OFFENCE_SEIZURE", localId.current)
+                .then((record) => {
+                    if (!record) return;
+                    if (record.serverId) {
+                        setReportId(record.serverId);
+                        setQueuedCreate(false);
+                        localStorage.setItem(`offenceSeizureReportId:${offline.ownerId}`, record.serverId);
+                        void loadEvidence(record.serverId);
+                    }
+                    if (record.status === "SUBMITTED") {
+                        setReportId(null);
+                        setFields(emptyFields);
+                        setReportText("");
+                        setPersonsText("[]");
+                        setSeizedMaterialText("[]");
+                        setWitnessesText("[]");
+                        setQueuedCreate(false);
+                        localId.current = createFieldLocalId();
+                    }
+                })
+                .catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Unable to refresh Offence & Seizure sync status."));
+        };
+        window.addEventListener("up-forest-offline-queue-changed", refreshRecord);
+        return () => window.removeEventListener("up-forest-offline-queue-changed", refreshRecord);
+    }, [offline.ownerId]);
+
+    useEffect(() => {
+        if (!offline.ownerId || !offlineDraftRestored || hasLocalEditorDraft) return;
+        let cancelled = false;
+        const savedId = localStorage.getItem(`offenceSeizureReportId:${offline.ownerId}`);
         if (!savedId) return;
 
         const restoreReport = async () => {
@@ -196,15 +301,19 @@ export function OffenceSeizureReport({ onClose }: Props) {
                 const response = await apiRequest<Record<string, unknown>>(
                     `/api/v1/field/forms/offence-seizure/${savedId}`
                 );
-
-                console.log("Restored offence report:", response);
-                const report = response as Partial<OffenceSeizureFields> & {
+                if (!response.success) {
+                    if (response.code !== "NETWORK" && response.code !== "TIMEOUT") {
+                        throw new Error(response.message || "Unable to restore saved draft.");
+                    }
+                    return;
+                }
+                const report = response.data as Partial<OffenceSeizureFields> & {
                     id?: string;
                     ai_confidence?: number | null;
                 };
-
+                if (cancelled) return;
                 setReportId(report.id ?? savedId);
-
+                localStorage.setItem(`offenceSeizureReportId:${offline.ownerId}`, report.id ?? savedId);
                 setFields((prev) => ({
                     ...prev,
                     ...Object.fromEntries(
@@ -214,20 +323,20 @@ export function OffenceSeizureReport({ onClose }: Props) {
                         ])
                     ),
                 }));
-
                 setPersonsText(formatJson(report.persons_involved ?? []));
                 setSeizedMaterialText(formatJson(report.seized_material ?? []));
                 setWitnessesText(formatJson(report.witnesses ?? []));
-
                 setConfidence(report.ai_confidence ?? null);
             } catch (error) {
-                console.error("Failed to restore offence report:", error);
-                toast.error("Unable to restore saved draft.");
+                if (!cancelled) {
+                    console.error("Failed to restore offence report:", error);
+                    toast.error(error instanceof Error ? error.message : "Unable to restore saved draft.");
+                }
             }
         };
-
         void restoreReport();
-    }, []);
+        return () => { cancelled = true; };
+    }, [hasLocalEditorDraft, offline.ownerId, offlineDraftRestored]);
 
 
     const [extracting, setExtracting] = useState(false);
@@ -362,20 +471,52 @@ export function OffenceSeizureReport({ onClose }: Props) {
 
         try {
             const payloadFields = buildPayload();
+            const localRecordId = localId.current || (localId.current = createFieldLocalId());
+            const payload = { fields: payloadFields as unknown as Record<string, unknown> };
+            const operationId = fieldCreateOperationId("OFFENCE_SEIZURE", localRecordId);
+            const record: OfflineFieldRecord = {
+                ownerId: offline.ownerId ?? "",
+                module: "OFFENCE_SEIZURE",
+                localId: localRecordId,
+                serverId: reportId,
+                payload,
+                status: "DRAFT",
+                syncError: null,
+                updatedAt: new Date().toISOString(),
+            };
+
+            if (offline.ownerId && (!navigator.onLine || (queuedCreate && !reportId))) {
+                await enqueueOfflineFieldOperation(
+                    offline.ownerId,
+                    "OFFENCE_SEIZURE",
+                    { ...record, ownerId: offline.ownerId },
+                    reportId || queuedCreate ? "UPDATE" : "CREATE",
+                );
+                if (!reportId) setQueuedCreate(true);
+                toast.info("Offence & Seizure draft is saved locally and will sync when the service is available.");
+                return;
+            }
 
             const response = await apiRequest<SaveResponse>(
-                reportId
-                    ? `/api/v1/field/forms/offence-seizure/${reportId}`
-                    : "/api/v1/field/forms/offence-seizure",
+                reportId ? `/api/v1/field/forms/offence-seizure/${reportId}` : "/api/v1/field/forms/offence-seizure",
                 {
                     method: reportId ? "PUT" : "POST",
-                    body: JSON.stringify({
-                        fields: payloadFields,
-                    }),
+                    body: JSON.stringify(reportId ? payload : { ...payload, client_operation_id: operationId }),
                 },
             );
 
             if (!response.success) {
+                if (offline.ownerId && fieldSyncableFailure(response)) {
+                    await enqueueOfflineFieldOperation(
+                        offline.ownerId,
+                        "OFFENCE_SEIZURE",
+                        { ...record, ownerId: offline.ownerId },
+                        reportId ? "UPDATE" : "CREATE",
+                    );
+                    if (!reportId) setQueuedCreate(true);
+                    toast.info("Offence & Seizure draft is saved locally and will sync when the service is available.");
+                    return;
+                }
                 throw new Error(
                     response.message ??
                     "Unable to save Offence & Seizure report.",
@@ -391,7 +532,8 @@ export function OffenceSeizureReport({ onClose }: Props) {
             }
 
             setReportId(savedId);
-            localStorage.setItem("offenceSeizureReportId", savedId);
+            setQueuedCreate(false);
+            if (offline.ownerId) localStorage.setItem(`offenceSeizureReportId:${offline.ownerId}`, savedId);
             await loadEvidence(savedId);
 
             toast.success(
@@ -418,7 +560,7 @@ export function OffenceSeizureReport({ onClose }: Props) {
 
         if (!file) return;
 
-        if (!reportId) {
+        if (!reportId && !queuedCreate) {
             toast.error("Please save the report before uploading evidence.");
             event.target.value = "";
             return;
@@ -446,12 +588,38 @@ export function OffenceSeizureReport({ onClose }: Props) {
         try {
             setUploadingEvidence(true);
 
+            const localRecordId = localId.current || (localId.current = createFieldLocalId());
+            const payloadFields = buildPayload();
+            const record: OfflineFieldRecord = {
+                ownerId: offline.ownerId ?? "",
+                module: "OFFENCE_SEIZURE",
+                localId: localRecordId,
+                serverId: reportId,
+                payload: { fields: payloadFields as unknown as Record<string, unknown> },
+                status: "DRAFT",
+                syncError: null,
+                updatedAt: new Date().toISOString(),
+            };
+            const evidenceOperationId = createFieldLocalId();
+            if (offline.ownerId && (!navigator.onLine || (queuedCreate && !reportId))) {
+                await enqueueOfflineEvidenceUpload(
+                    offline.ownerId,
+                    { ...record, ownerId: offline.ownerId },
+                    file,
+                    null,
+                    evidenceOperationId,
+                );
+                toast.info("Evidence is saved locally and will upload after the report draft syncs.");
+                return;
+            }
+
             const formData = new FormData();
             formData.append("file", file);
             formData.append("report_type", "OFFENCE_SEIZURE");
-            formData.append("report_id", reportId);
+            formData.append("report_id", reportId!);
+            formData.append("client_operation_id", `evidence:${localRecordId}:${evidenceOperationId}`);
 
-            const response = await apiRequest(
+            const response = await apiRequest<{ evidence: EvidenceFile }>(
                 "/api/v1/field/evidence/upload",
                 {
                     method: "POST",
@@ -459,11 +627,25 @@ export function OffenceSeizureReport({ onClose }: Props) {
                 }
             );
 
-            const uploadedFile = (response as unknown as {
-                evidence: EvidenceFile;
-            }).evidence;
+            if (!response.success) {
+                if (offline.ownerId && fieldSyncableFailure(response)) {
+                    await enqueueOfflineEvidenceUpload(
+                        offline.ownerId,
+                        { ...record, ownerId: offline.ownerId },
+                        file,
+                        null,
+                        evidenceOperationId,
+                    );
+                    toast.info("Evidence is saved locally and will upload when the service is available.");
+                    return;
+                }
+                throw new Error(response.message ?? "Unable to upload evidence.");
+            }
+
+            const uploadedFile = response.data.evidence;
 
             setEvidenceFiles((prev) => [uploadedFile, ...prev]);
+            await loadEvidence(reportId!);
 
             toast.success("Evidence uploaded successfully.");
         } catch (error) {
@@ -557,7 +739,7 @@ export function OffenceSeizureReport({ onClose }: Props) {
     };
 
     const handleSubmit = async () => {
-        if (!reportId) {
+        if (!reportId && !queuedCreate) {
             toast.error(
                 "Please save the report as a draft first.",
             );
@@ -567,19 +749,50 @@ export function OffenceSeizureReport({ onClose }: Props) {
         setSubmitting(true);
 
         try {
-            await apiRequest(
+            const payloadFields = buildPayload();
+            const localRecordId = localId.current || (localId.current = createFieldLocalId());
+            const record: OfflineFieldRecord = {
+                ownerId: offline.ownerId ?? "",
+                module: "OFFENCE_SEIZURE",
+                localId: localRecordId,
+                serverId: reportId,
+                payload: { fields: payloadFields as unknown as Record<string, unknown> },
+                status: "PENDING_SUBMISSION",
+                syncError: null,
+                updatedAt: new Date().toISOString(),
+            };
+            if (offline.ownerId && (!navigator.onLine || (queuedCreate && !reportId))) {
+                await enqueueOfflineFieldOperation(offline.ownerId, "OFFENCE_SEIZURE", { ...record, ownerId: offline.ownerId }, "SUBMIT");
+                toast.info("Submission is pending sync and server validation.");
+                return;
+            }
+            const response = await apiRequest(
                 `/api/v1/field/forms/offence-seizure/${reportId}/submit`,
                 {
                     method: "POST",
                 },
             );
+            if (!response.success) {
+                if (offline.ownerId && fieldSyncableFailure(response)) {
+                    await enqueueOfflineFieldOperation(offline.ownerId, "OFFENCE_SEIZURE", { ...record, ownerId: offline.ownerId }, "SUBMIT");
+                    toast.info("Submission is pending sync and server validation.");
+                    return;
+                }
+                throw new Error(response.message ?? "Unable to submit report.");
+            }
 
             toast.success(
                 "Offence & Seizure Report submitted successfully.",
             );
 
             setReportId(null);
+            setQueuedCreate(false);
             setFields(emptyFields);
+            if (offline.ownerId) localStorage.removeItem(`offenceSeizureReportId:${offline.ownerId}`);
+            if (localStorage.getItem("offenceSeizureReportId") === reportId) {
+                localStorage.removeItem("offenceSeizureReportId");
+            }
+            localId.current = createFieldLocalId();
             setReportText("");
             setPersonsText("[]");
             setSeizedMaterialText("[]");
@@ -599,6 +812,7 @@ export function OffenceSeizureReport({ onClose }: Props) {
 
     return (
         <div className="space-y-6 rounded-2xl border border-gray-200 bg-white p-5 shadow-sm">
+            <OfflineFieldFormControls {...offline} />
             {/* Header */}
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div>
@@ -1016,7 +1230,7 @@ export function OffenceSeizureReport({ onClose }: Props) {
                     type="button"
                     onClick={handleSubmit}
                     disabled={
-                        !reportId ||
+                        (!reportId && !queuedCreate) ||
                         saving ||
                         submitting
                     }

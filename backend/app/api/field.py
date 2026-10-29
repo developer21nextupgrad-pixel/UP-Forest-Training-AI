@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File,
 from fastapi.responses import FileResponse
 
 from sqlalchemy import select
-
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -569,7 +569,31 @@ async def extract_incident_report(
 
         )        
 
+@router.post("/forms/daily-diary/extract")
+async def extract_daily_diary(
+    payload: PatrolReportExtractRequest,
+    _: User = Depends(require_field_officer),
+):
+    """Extract Daily Diary fields without saving to the database."""
 
+    try:
+        service = FieldFormExtractionService()
+        fields = await service.extract_daily_diary(payload.text)
+        return {
+            "success": True,
+            "fields": fields,
+        }
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        ) from exc
+    except Exception:
+        logger.exception("Daily Diary extraction failed.")
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to extract Daily Diary fields.",
+        )
 
 @router.post(
 
@@ -1271,49 +1295,45 @@ async def save_patrol_report_draft(
 
     """
 
+    def apply_payload(report: FieldPatrolReport) -> None:
+        for field_name in (
+            "patrol_date", "beat", "range_name", "division", "start_time", "end_time",
+            "location", "team_members", "purpose", "observations", "wildlife_sighting",
+            "illegal_activity", "action_taken", "incident_details", "additional_remarks",
+            "source_text", "ai_confidence",
+        ):
+            setattr(report, field_name, getattr(payload, field_name))
 
+    if payload.client_operation_id:
+        existing = await session.execute(
+            select(FieldPatrolReport).where(
+                FieldPatrolReport.officer_id == user.id,
+                FieldPatrolReport.client_operation_id == payload.client_operation_id,
+            )
+        )
+        report = existing.scalar_one_or_none()
+        if report is not None:
+            if report.status == "DRAFT":
+                apply_payload(report)
+                await session.commit()
+            return PatrolReportSaveResponse(
+                success=True,
+                report_id=str(report.id),
+                form_type="PATROL_REPORT",
+                status=report.status,
+                message="Patrol report draft saved successfully.",
+            )
 
     report = FieldPatrolReport(
 
         officer_id=user.id,
 
         status="DRAFT",
-
-        patrol_date=payload.patrol_date,
-
-        beat=payload.beat,
-
-        range_name=payload.range_name,
-
-        division=payload.division,
-
-        start_time=payload.start_time,
-
-        end_time=payload.end_time,
-
-        location=payload.location,
-
-        team_members=payload.team_members,
-
-        purpose=payload.purpose,
-
-        observations=payload.observations,
-
-        wildlife_sighting=payload.wildlife_sighting,
-
-        illegal_activity=payload.illegal_activity,
-
-        action_taken=payload.action_taken,
-
-        incident_details=payload.incident_details,
-
-        additional_remarks=payload.additional_remarks,
-
-        source_text=payload.source_text,
-
-        ai_confidence=payload.ai_confidence,
+        client_operation_id=payload.client_operation_id,
 
     )
+
+    apply_payload(report)
 
 
 
@@ -1329,6 +1349,26 @@ async def save_patrol_report_draft(
 
 
 
+    except IntegrityError:
+        await session.rollback()
+        if payload.client_operation_id:
+            existing = await session.execute(
+                select(FieldPatrolReport).where(
+                    FieldPatrolReport.officer_id == user.id,
+                    FieldPatrolReport.client_operation_id == payload.client_operation_id,
+                )
+            )
+            report = existing.scalar_one_or_none()
+            if report is not None:
+                return PatrolReportSaveResponse(
+                    success=True,
+                    report_id=str(report.id),
+                    form_type="PATROL_REPORT",
+                    status=report.status,
+                    message="Patrol report draft saved successfully.",
+                )
+        logger.exception("Failed idempotent patrol report create for officer %s", user.id)
+        raise HTTPException(status_code=500, detail="Unable to save patrol report draft.")
     except Exception:
 
         await session.rollback()
@@ -1395,49 +1435,45 @@ async def save_incident_report_draft(
 
     """
 
+    def apply_payload(report: IncidentReport) -> None:
+        for field_name in (
+            "incident_date", "incident_time", "division", "range_name", "beat", "location",
+            "incident_type", "reported_by", "persons_involved", "wildlife_involved",
+            "incident_description", "immediate_action_taken", "authorities_informed",
+            "injury_or_damage", "evidence_details", "additional_remarks", "source_text",
+        ):
+            setattr(report, field_name, getattr(payload, field_name))
 
+    if payload.client_operation_id:
+        existing = await session.execute(
+            select(IncidentReport).where(
+                IncidentReport.officer_id == user.id,
+                IncidentReport.client_operation_id == payload.client_operation_id,
+            )
+        )
+        report = existing.scalar_one_or_none()
+        if report is not None:
+            if report.status == "DRAFT":
+                apply_payload(report)
+                await session.commit()
+            return IncidentReportSaveResponse(
+                success=True,
+                incident_id=str(report.id),
+                form_type="INCIDENT_REPORT",
+                status=report.status,
+                message="Incident report draft saved successfully.",
+            )
 
     report = IncidentReport(
 
         officer_id=user.id,
 
         status="DRAFT",
-
-        incident_date=payload.incident_date,
-
-        incident_time=payload.incident_time,
-
-        division=payload.division,
-
-        range_name=payload.range_name,
-
-        beat=payload.beat,
-
-        location=payload.location,
-
-        incident_type=payload.incident_type,
-
-        reported_by=payload.reported_by,
-
-        persons_involved=payload.persons_involved,
-
-        wildlife_involved=payload.wildlife_involved,
-
-        incident_description=payload.incident_description,
-
-        immediate_action_taken=payload.immediate_action_taken,
-
-        authorities_informed=payload.authorities_informed,
-
-        injury_or_damage=payload.injury_or_damage,
-
-        evidence_details=payload.evidence_details,
-
-        additional_remarks=payload.additional_remarks,
-
-        source_text=payload.source_text,
+        client_operation_id=payload.client_operation_id,
 
     )
+
+    apply_payload(report)
 
 
 
@@ -1453,6 +1489,26 @@ async def save_incident_report_draft(
 
 
 
+    except IntegrityError:
+        await session.rollback()
+        if payload.client_operation_id:
+            existing = await session.execute(
+                select(IncidentReport).where(
+                    IncidentReport.officer_id == user.id,
+                    IncidentReport.client_operation_id == payload.client_operation_id,
+                )
+            )
+            report = existing.scalar_one_or_none()
+            if report is not None:
+                return IncidentReportSaveResponse(
+                    success=True,
+                    incident_id=str(report.id),
+                    form_type="INCIDENT_REPORT",
+                    status=report.status,
+                    message="Incident report draft saved successfully.",
+                )
+        logger.exception("Failed idempotent incident report create for officer %s", user.id)
+        raise HTTPException(status_code=500, detail="Unable to save incident report draft.")
     except Exception:
 
         await session.rollback()
@@ -1523,67 +1579,47 @@ async def save_offence_seizure_report_draft(
 
     fields = payload.fields
 
+    def apply_fields(report: OffenceSeizureReport) -> None:
+        for field_name in (
+            "offence_date", "offence_time", "division", "range_name", "beat", "location",
+            "offence_type", "applicable_law", "applicable_section", "persons_involved",
+            "seized_material", "seizure_location", "seizure_date", "seizure_time",
+            "vehicle_details", "vehicle_registration_number", "evidence_details", "witnesses",
+            "action_taken", "authorities_informed", "case_reference_number", "fir_number",
+            "incident_reference_id", "description", "additional_remarks", "ai_confidence",
+        ):
+            setattr(report, field_name, getattr(fields, field_name))
 
+    if payload.client_operation_id:
+        existing = await session.execute(
+            select(OffenceSeizureReport).where(
+                OffenceSeizureReport.officer_id == user.id,
+                OffenceSeizureReport.client_operation_id == payload.client_operation_id,
+            )
+        )
+        report = existing.scalar_one_or_none()
+        if report is not None:
+            if report.status == "DRAFT":
+                apply_fields(report)
+                await session.commit()
+            return OffenceSeizureReportSaveResponse(
+                success=True,
+                report_id=str(report.id),
+                form_type="OFFENCE_SEIZURE",
+                status=report.status,
+                message="Offence & Seizure Report draft saved successfully.",
+            )
 
     report = OffenceSeizureReport(
 
         officer_id=user.id,
 
         status="DRAFT",
-
-        offence_date=fields.offence_date,
-
-        offence_time=fields.offence_time,
-
-        division=fields.division,
-
-        range_name=fields.range_name,
-
-        beat=fields.beat,
-
-        location=fields.location,
-
-        offence_type=fields.offence_type,
-
-        applicable_law=fields.applicable_law,
-
-        applicable_section=fields.applicable_section,
-
-        persons_involved=fields.persons_involved,
-
-        seized_material=fields.seized_material,
-
-        seizure_location=fields.seizure_location,
-
-        seizure_date=fields.seizure_date,
-
-        seizure_time=fields.seizure_time,
-
-        vehicle_details=fields.vehicle_details,
-
-        vehicle_registration_number=fields.vehicle_registration_number,
-
-        evidence_details=fields.evidence_details,
-
-        witnesses=fields.witnesses,
-
-        action_taken=fields.action_taken,
-
-        authorities_informed=fields.authorities_informed,
-
-        case_reference_number=fields.case_reference_number,
-
-        fir_number=fields.fir_number,
-
-        incident_reference_id=fields.incident_reference_id,
-
-        description=fields.description,
-
-        additional_remarks=fields.additional_remarks,
-
-        ai_confidence=fields.ai_confidence,
+        client_operation_id=payload.client_operation_id,
 
     )
+
+    apply_fields(report)
 
 
 
@@ -1599,6 +1635,26 @@ async def save_offence_seizure_report_draft(
 
 
 
+    except IntegrityError:
+        await session.rollback()
+        if payload.client_operation_id:
+            existing = await session.execute(
+                select(OffenceSeizureReport).where(
+                    OffenceSeizureReport.officer_id == user.id,
+                    OffenceSeizureReport.client_operation_id == payload.client_operation_id,
+                )
+            )
+            report = existing.scalar_one_or_none()
+            if report is not None:
+                return OffenceSeizureReportSaveResponse(
+                    success=True,
+                    report_id=str(report.id),
+                    form_type="OFFENCE_SEIZURE",
+                    status=report.status,
+                    message="Offence & Seizure Report draft saved successfully.",
+                )
+        logger.exception("Failed idempotent offence report create for officer %s", user.id)
+        raise HTTPException(status_code=500, detail="Unable to save Offence & Seizure Report draft.")
     except Exception:
 
         await session.rollback()
@@ -2206,6 +2262,16 @@ async def submit_incident_report(
 
         )
 
+    if report.status == "SUBMITTED":
+        return IncidentReportSubmitResponse(
+            success=True,
+            incident_id=str(report.id),
+            form_type="INCIDENT_REPORT",
+            status=report.status,
+            submitted_at=report.submitted_at.isoformat() if report.submitted_at else "",
+            message="Incident report submitted successfully.",
+        )
+
 
 
     if report.status != "DRAFT":
@@ -2372,6 +2438,13 @@ async def submit_offence_seizure_report(
 
             detail="You are not allowed to submit this Offence & Seizure Report.",
 
+        )
+
+    if report.status == "SUBMITTED":
+        return OffenceSeizureReportSubmitResponse(
+            success=True,
+            message="Offence & Seizure Report submitted successfully.",
+            report_id=report.id,
         )
 
 
@@ -2915,6 +2988,7 @@ async def upload_evidence(
     report_id: UUID = Form(...),
     file: UploadFile = File(...),
     description: str | None = Form(None),
+    client_operation_id: str | None = Form(None, max_length=100),
     user: User = Depends(require_field_officer),
     session: AsyncSession = Depends(get_db_session),
 ):
@@ -3042,6 +3116,36 @@ async def upload_evidence(
             detail="Report not found or you do not have access to it.",
         )
 
+    if client_operation_id:
+        existing_result = await session.execute(
+            select(Evidence).where(
+                Evidence.officer_id == user.id,
+                Evidence.client_operation_id == client_operation_id,
+            )
+        )
+        existing = existing_result.scalar_one_or_none()
+        if existing is not None:
+            if existing.report_type != report_type or existing.report_id != report_id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Evidence operation ID was already used for a different report.",
+                )
+            return {
+                "success": True,
+                "message": "Evidence uploaded successfully.",
+                "evidence": {
+                    "id": str(existing.id),
+                    "report_type": existing.report_type,
+                    "report_id": str(existing.report_id),
+                    "file_name": existing.file_name,
+                    "file_type": existing.file_type,
+                    "file_size": existing.file_size,
+                    "mime_type": existing.mime_type,
+                    "description": existing.description,
+                    "uploaded_at": existing.uploaded_at.isoformat() if existing.uploaded_at else None,
+                },
+            }
+
     # ---------------------------------------------------------
     # Store the file using a random filename.
     # Never use the original filename as the storage filename.
@@ -3060,6 +3164,7 @@ async def upload_evidence(
             report_type=report_type,
             report_id=report_id,
             officer_id=user.id,
+            client_operation_id=client_operation_id,
             file_name=original_filename,
             storage_key=str(storage_path),
             file_type=extension.lstrip("."),
@@ -3072,6 +3177,37 @@ async def upload_evidence(
         await session.commit()
         await session.refresh(evidence)
 
+    except IntegrityError:
+        await session.rollback()
+        existing_result = await session.execute(
+            select(Evidence).where(
+                Evidence.officer_id == user.id,
+                Evidence.client_operation_id == client_operation_id,
+            )
+        ) if client_operation_id else None
+        existing = existing_result.scalar_one_or_none() if existing_result is not None else None
+        if existing is not None and existing.report_type == report_type and existing.report_id == report_id:
+            if storage_path.exists():
+                storage_path.unlink()
+            return {
+                "success": True,
+                "message": "Evidence uploaded successfully.",
+                "evidence": {
+                    "id": str(existing.id),
+                    "report_type": existing.report_type,
+                    "report_id": str(existing.report_id),
+                    "file_name": existing.file_name,
+                    "file_type": existing.file_type,
+                    "file_size": existing.file_size,
+                    "mime_type": existing.mime_type,
+                    "description": existing.description,
+                    "uploaded_at": existing.uploaded_at.isoformat() if existing.uploaded_at else None,
+                },
+            }
+        if storage_path.exists():
+            storage_path.unlink()
+        logger.exception("Failed idempotent evidence upload for report %s", report_id)
+        raise HTTPException(status_code=500, detail="Unable to upload evidence.")
     except Exception:
         await session.rollback()
 
@@ -3730,6 +3866,16 @@ async def submit_patrol_report(
 
         )
 
+    if report.status == "SUBMITTED":
+        return PatrolReportSubmitResponse(
+            success=True,
+            report_id=str(report.id),
+            form_type="PATROL_REPORT",
+            status=report.status,
+            submitted_at=report.submitted_at.isoformat() if report.submitted_at else "",
+            message="Patrol report submitted successfully.",
+        )
+
 
 
     if report.status != "DRAFT":
@@ -3888,11 +4034,42 @@ async def save_daily_diary_draft(
 
 ) -> DailyDiarySaveResponse:
 
+    def apply_payload(diary: DailyDiary) -> None:
+        diary.diary_date = payload.diary_date
+        diary.subject = payload.subject
+        diary.description = payload.description
+        diary.location = payload.location
+        diary.activities = payload.activities
+        diary.observations = payload.observations
+        diary.additional_remarks = payload.additional_remarks
+        diary.source_text = payload.source_text
+
+    if payload.client_operation_id:
+        existing = await session.execute(
+            select(DailyDiary).where(
+                DailyDiary.officer_id == user.id,
+                DailyDiary.client_operation_id == payload.client_operation_id,
+            )
+        )
+        diary = existing.scalar_one_or_none()
+        if diary is not None:
+            if diary.status == "DRAFT":
+                apply_payload(diary)
+                await session.commit()
+            return DailyDiarySaveResponse(
+                success=True,
+                diary_id=str(diary.id),
+                form_type="DAILY_DIARY",
+                status=diary.status,
+            )
+
     diary = DailyDiary(
 
         officer_id=user.id,
 
         status="DRAFT",
+
+        client_operation_id=payload.client_operation_id,
 
         diary_date=payload.diary_date,
 
@@ -3924,10 +4101,33 @@ async def save_daily_diary_draft(
 
         await session.refresh(diary)
 
-    except Exception:
-
+    except IntegrityError:
         await session.rollback()
-
+        if payload.client_operation_id:
+            existing = await session.execute(
+                select(DailyDiary).where(
+                    DailyDiary.officer_id == user.id,
+                    DailyDiary.client_operation_id == payload.client_operation_id,
+                )
+            )
+            diary = existing.scalar_one_or_none()
+            if diary is not None:
+                if diary.status == "DRAFT":
+                    apply_payload(diary)
+                    await session.commit()
+                return DailyDiarySaveResponse(
+                    success=True,
+                    diary_id=str(diary.id),
+                    form_type="DAILY_DIARY",
+                    status=diary.status,
+                )
+        logger.exception("Failed to save daily diary draft")
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to save daily diary draft.",
+        )
+    except Exception:
+        await session.rollback()
         logger.exception("Failed to save daily diary draft")
 
         raise HTTPException(
@@ -4136,8 +4336,6 @@ async def update_daily_diary_draft(
 
         )
 
-
-
     if diary.status != "DRAFT":
 
         raise HTTPException(
@@ -4250,7 +4448,15 @@ async def submit_daily_diary(
 
         )
 
-
+    if diary.status == "SUBMITTED" and diary.submitted_at is not None:
+        return DailyDiarySubmitResponse(
+            success=True,
+            diary_id=str(diary.id),
+            form_type="DAILY_DIARY",
+            status="SUBMITTED",
+            submitted_at=diary.submitted_at.isoformat(),
+            message="Daily diary was already submitted.",
+        )
 
     if diary.status != "DRAFT":
 

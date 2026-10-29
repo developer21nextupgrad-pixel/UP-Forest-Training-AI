@@ -10,6 +10,7 @@ import {
   ScanSearch,
   ArrowRight,
   Trees,
+  MessageCircle,
 } from "lucide-react";
 
 const modules = [
@@ -54,6 +55,13 @@ const modules = [
       "Use the species identification module for field assistance.",
     href: "/field/species",
     icon: ScanSearch,
+  },
+  {
+    title: "WhatsApp Assistant",
+    description:
+      "Pair your WhatsApp number to ask document-grounded forest and field questions.",
+    href: "/field/whatsapp",
+    icon: MessageCircle,
   },
 ];
 

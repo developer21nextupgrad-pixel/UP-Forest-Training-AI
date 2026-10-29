@@ -2,7 +2,7 @@
 
 
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 
 import {
 
@@ -27,6 +27,18 @@ import {
 import { toast } from "sonner";
 
 import { apiRequest } from "@/lib/api";
+import {
+    createFieldLocalId,
+    enqueueOfflineFieldOperation,
+    fieldCreateOperationId,
+    fieldSyncableFailure,
+    getOfflineFormRecord,
+    loadOfflineFormDraft,
+    saveOfflineFormDraft,
+    useOfflineFieldForm,
+    type OfflineFieldRecord,
+} from "@/lib/offline-field-forms";
+import { OfflineFieldFormControls } from "./offline-field-form-controls";
 
 
 
@@ -270,6 +282,10 @@ function createNewFields(): IncidentFields {
 
 export function IncidentReport() {
 
+    const offline = useOfflineFieldForm("INCIDENT_REPORT");
+    const localId = useRef("");
+    const previousOwnerId = useRef<string | null>(null);
+
     const [fields, setFields] =
 
         useState<IncidentFields>(createNewFields);
@@ -297,6 +313,73 @@ export function IncidentReport() {
     const [confidence, setConfidence] = useState<number | null>(null);
 
     const [missingFields, setMissingFields] = useState<string[]>([]);
+    const [queuedCreate, setQueuedCreate] = useState(false);
+    const [offlineDraftRestored, setOfflineDraftRestored] = useState(false);
+
+    useEffect(() => {
+        if (!localId.current) localId.current = createFieldLocalId();
+    }, []);
+
+    useEffect(() => {
+        if (previousOwnerId.current !== offline.ownerId) {
+            previousOwnerId.current = offline.ownerId;
+            setFields(createNewFields());
+            setIncidentText("");
+            setEditingId(null);
+            setConfidence(null);
+            setMissingFields([]);
+            setQueuedCreate(false);
+            localId.current = offline.ownerId ? createFieldLocalId() : "";
+        }
+        setOfflineDraftRestored(false);
+        if (!offline.ownerId) return;
+        let cancelled = false;
+        void loadOfflineFormDraft<Record<string, unknown>>(offline.ownerId, "INCIDENT_REPORT", "active")
+            .then((draft) => {
+                if (cancelled || !draft) return;
+                const snapshot = draft.snapshot;
+                if (typeof snapshot.localId === "string") localId.current = snapshot.localId;
+                if (snapshot.fields && typeof snapshot.fields === "object") setFields(snapshot.fields as IncidentFields);
+                if (typeof snapshot.incidentText === "string") setIncidentText(snapshot.incidentText);
+                if (typeof snapshot.editingId === "string") setEditingId(snapshot.editingId);
+                if (typeof snapshot.confidence === "number" || snapshot.confidence === null) setConfidence(snapshot.confidence as number | null);
+                setQueuedCreate(snapshot.queuedCreate === true);
+                toast.info("Restored your locally saved incident report draft.");
+            })
+            .catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Unable to restore the local incident draft."))
+            .finally(() => { if (!cancelled) setOfflineDraftRestored(true); });
+        return () => { cancelled = true; };
+    }, [offline.ownerId]);
+
+    useEffect(() => {
+        if (!offline.ownerId || !offlineDraftRestored || !localId.current) return;
+        void saveOfflineFormDraft(offline.ownerId, "INCIDENT_REPORT", "active", {
+            localId: localId.current,
+            fields: fields as unknown as Record<string, unknown>,
+            incidentText,
+            editingId,
+            confidence,
+            queuedCreate,
+        }).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Unable to save the local incident draft."));
+    }, [confidence, editingId, fields, incidentText, offline.ownerId, offlineDraftRestored, queuedCreate]);
+
+    useEffect(() => {
+        if (!offline.ownerId || !localId.current) return;
+        const refreshRecord = () => {
+            void getOfflineFormRecord(offline.ownerId!, "INCIDENT_REPORT", localId.current)
+                .then((record) => {
+                    if (!record) return;
+                    if (record.serverId) {
+                        setEditingId(record.serverId);
+                        setQueuedCreate(false);
+                    }
+                    if (record.status === "SUBMITTED") resetForm();
+                })
+                .catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Unable to refresh incident sync status."));
+        };
+        window.addEventListener("up-forest-offline-queue-changed", refreshRecord);
+        return () => window.removeEventListener("up-forest-offline-queue-changed", refreshRecord);
+    }, [offline.ownerId]);
 
 
 
@@ -495,6 +578,8 @@ export function IncidentReport() {
         setConfidence(null);
 
         setMissingFields([]);
+        setQueuedCreate(false);
+        localId.current = createFieldLocalId();
 
     };
 
@@ -564,71 +649,64 @@ export function IncidentReport() {
 
         try {
 
-            if (editingId) {
+            const createId = fieldCreateOperationId(
+                "INCIDENT_REPORT",
+                localId.current || (localId.current = createFieldLocalId()),
+            );
+            const record: OfflineFieldRecord = {
+                ownerId: offline.ownerId ?? "",
+                module: "INCIDENT_REPORT",
+                localId: localId.current,
+                serverId: editingId,
+                payload,
+                status: "DRAFT",
+                syncError: null,
+                updatedAt: new Date().toISOString(),
+            };
+            const isQueuedUpdate = queuedCreate && !editingId;
 
-                await apiRequest(
-
-                    `/api/v1/field/forms/incident/${editingId}`,
-
-                    {
-
-                        method: "PUT",
-
-                        body: JSON.stringify(payload),
-
-                    },
-
+            if (offline.ownerId && (!navigator.onLine || isQueuedUpdate)) {
+                await enqueueOfflineFieldOperation(
+                    offline.ownerId,
+                    "INCIDENT_REPORT",
+                    { ...record, ownerId: offline.ownerId },
+                    editingId || isQueuedUpdate ? "UPDATE" : "CREATE",
                 );
-
-
-
-                toast.success("Incident report draft updated.");
-
-            } else {
-
-                const response = await apiRequest<{
-
-                    success: boolean;
-
-                    incident_id: string;
-
-                    status: string;
-
-                    message?: string;
-
-                }>("/api/v1/field/forms/incident", {
-
-                    method: "POST",
-
-                    body: JSON.stringify(payload),
-
-                });
-
-
-
-                if (!response.success) {
-
-                    throw new Error(
-
-                        response.message ??
-
-                        "Unable to save incident report draft.",
-
-                    );
-
-                }
-
-
-
-                setEditingId(response.incident_id);
-
-
-
-                toast.success("Incident report draft saved.");
-
+                if (!editingId && !isQueuedUpdate) setQueuedCreate(true);
+                toast.info("Incident report draft is saved locally and will sync when the service is available.");
+                return;
             }
 
+            const response = await apiRequest<{
+                incident_id: string;
+                status: string;
+                message?: string;
+            }>(
+                editingId ? `/api/v1/field/forms/incident/${editingId}` : "/api/v1/field/forms/incident",
+                {
+                    method: editingId ? "PUT" : "POST",
+                    body: JSON.stringify(editingId ? payload : { ...payload, client_operation_id: createId }),
+                },
+            );
 
+            if (!response.success) {
+                if (offline.ownerId && fieldSyncableFailure(response)) {
+                    await enqueueOfflineFieldOperation(
+                        offline.ownerId,
+                        "INCIDENT_REPORT",
+                        { ...record, ownerId: offline.ownerId },
+                        editingId ? "UPDATE" : "CREATE",
+                    );
+                    if (!editingId) setQueuedCreate(true);
+                    toast.info("Incident report draft is saved locally and will sync when the service is available.");
+                    return;
+                }
+                throw new Error(response.message ?? "Unable to save incident report draft.");
+            }
+
+            if (!editingId) setEditingId(response.data.incident_id);
+            setQueuedCreate(false);
+            toast.success(editingId ? "Incident report draft updated." : "Incident report draft saved.");
 
             await loadReports();
 
@@ -660,7 +738,7 @@ export function IncidentReport() {
 
 
 
-        if (!id) {
+        if (!id && !queuedCreate) {
 
             toast.error(
 
@@ -679,6 +757,47 @@ export function IncidentReport() {
 
 
         try {
+
+            const report = id ? reports.find((item) => item.incident_id === id) : undefined;
+            const payload = report
+                ? {
+                    incident_date: report.incident_date,
+                    incident_time: report.incident_time,
+                    division: report.division,
+                    range_name: report.range_name,
+                    beat: report.beat,
+                    location: report.location,
+                    incident_type: report.incident_type,
+                    reported_by: report.reported_by,
+                    persons_involved: report.persons_involved,
+                    wildlife_involved: report.wildlife_involved,
+                    incident_description: report.incident_description,
+                    immediate_action_taken: report.immediate_action_taken,
+                    authorities_informed: report.authorities_informed,
+                    injury_or_damage: report.injury_or_damage,
+                    evidence_details: report.evidence_details,
+                    additional_remarks: report.additional_remarks,
+                    source_text: report.source_text,
+                }
+                : fields as unknown as Record<string, unknown>;
+            const operationLocalId = localId.current ||
+                (localId.current = id ?? createFieldLocalId());
+            if (offline.ownerId && (!navigator.onLine || (queuedCreate && !id))) {
+                const record: OfflineFieldRecord = {
+                    ownerId: offline.ownerId,
+                    module: "INCIDENT_REPORT",
+                    localId: operationLocalId,
+                    serverId: id || null,
+                    payload,
+                    status: "PENDING_SUBMISSION",
+                    syncError: null,
+                    updatedAt: new Date().toISOString(),
+                };
+                await enqueueOfflineFieldOperation(offline.ownerId, "INCIDENT_REPORT", record, "SUBMIT");
+                toast.info("Submission is pending sync and server validation.");
+                return;
+            }
+            if (!id) throw new Error("Save the incident report draft before submitting.");
 
             const response = await apiRequest<{
 
@@ -720,6 +839,21 @@ export function IncidentReport() {
 
             if (!response.success) {
 
+                if (offline.ownerId && fieldSyncableFailure(response)) {
+                    const record: OfflineFieldRecord = {
+                        ownerId: offline.ownerId,
+                        module: "INCIDENT_REPORT",
+                        localId: operationLocalId,
+                        serverId: id || null,
+                        payload,
+                        status: "PENDING_SUBMISSION",
+                        syncError: null,
+                        updatedAt: new Date().toISOString(),
+                    };
+                    await enqueueOfflineFieldOperation(offline.ownerId, "INCIDENT_REPORT", record, "SUBMIT");
+                    toast.info("Submission is pending sync and server validation.");
+                    return;
+                }
                 throw new Error(
 
                     response.message ??
@@ -1076,6 +1210,8 @@ export function IncidentReport() {
 
         <section className="space-y-6">
 
+            <OfflineFieldFormControls {...offline} />
+
             {/* Header */}
 
             <div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
@@ -1206,7 +1342,7 @@ export function IncidentReport() {
 
 
 
-                    {editingId && (
+                    {(editingId || queuedCreate) && (
 
                         <span className="rounded-full bg-blue-50 px-3 py-1.5 text-xs font-medium text-blue-700">
 

@@ -710,13 +710,22 @@ __all__ = [
     "Document", "DocumentVersion", "DocumentPage", "DocumentChunk", "DocumentIngestionJob", "Enrollment",
     "LearningProgress", "LearningHistory", "ChatSession", "ChatMessage",
     "Quiz", "Question", "QuizOption", "QuizAttempt", "QuizAnswer", "QuizGenerationJob",
-    "WeakTopic", "ReviewSchedule", "AuditLog", "RefreshTokenSession", "PasswordResetToken","FieldPatrolReport","IncidentReport","OffenceSeizureReport",
+    "WeakTopic", "ReviewSchedule", "AuditLog", "RefreshTokenSession", "PasswordResetToken",
+    "FieldPatrolReport", "IncidentReport", "OffenceSeizureReport",
+    "WhatsAppOfficerLink", "WhatsAppInboundMessage",
 ]
 
 class FieldPatrolReport(Base):
     """Saved patrol report created by a Field Officer."""
 
     __tablename__ = "field_patrol_reports"
+    __table_args__ = (
+        UniqueConstraint(
+            "officer_id",
+            "client_operation_id",
+            name="uq_patrol_report_officer_operation",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(
     Uuid(as_uuid=True),
@@ -737,6 +746,8 @@ class FieldPatrolReport(Base):
         default="DRAFT",
         index=True,
     )
+
+    client_operation_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     patrol_date: Mapped[date | None] = mapped_column(
         Date,
@@ -870,6 +881,13 @@ class IncidentReport(Base):
     """Incident report created by a Field Officer."""
 
     __tablename__ = "incident_reports"
+    __table_args__ = (
+        UniqueConstraint(
+            "officer_id",
+            "client_operation_id",
+            name="uq_incident_report_officer_operation",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -890,6 +908,8 @@ class IncidentReport(Base):
         default="DRAFT",
         index=True,
     )
+
+    client_operation_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     incident_date: Mapped[date | None] = mapped_column(
         Date,
@@ -1021,6 +1041,13 @@ class IncidentReport(Base):
 
 class OffenceSeizureReport(Base):
     __tablename__ = "offence_seizure_reports"
+    __table_args__ = (
+        UniqueConstraint(
+            "officer_id",
+            "client_operation_id",
+            name="uq_offence_report_officer_operation",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -1041,6 +1068,8 @@ class OffenceSeizureReport(Base):
         default="DRAFT",
         index=True,
     )
+
+    client_operation_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     # ---------------------------------------------------------
     # Offence details
@@ -1260,6 +1289,13 @@ class OffenceSeizureReport(Base):
     
 class Evidence(Base):
     __tablename__ = "evidence"
+    __table_args__ = (
+        UniqueConstraint(
+            "officer_id",
+            "client_operation_id",
+            name="uq_evidence_officer_operation",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -1284,6 +1320,8 @@ class Evidence(Base):
         nullable=False,
         index=True,
     )
+
+    client_operation_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     file_name: Mapped[str] = mapped_column(
         Text,
@@ -1326,6 +1364,13 @@ class DailyDiary(Base):
     """Daily diary entry created by a Field Officer."""
 
     __tablename__ = "daily_diaries"
+    __table_args__ = (
+        UniqueConstraint(
+            "officer_id",
+            "client_operation_id",
+            name="uq_daily_diary_officer_operation",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -1345,6 +1390,11 @@ class DailyDiary(Base):
         nullable=False,
         default="DRAFT",
         index=True,
+    )
+
+    client_operation_id: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
     )
 
     diary_date: Mapped[date | None] = mapped_column(

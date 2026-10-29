@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, useRef, useState } from "react";
+import { ChangeEvent, useCallback, useEffect, useRef, useState } from "react";
 import {
     Camera,
     CheckCircle2,
@@ -13,6 +13,13 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { apiRequest } from "@/lib/api";
+import { checkDiaryBackendReachable } from "@/lib/offline-diary";
+import { getStoredUser } from "@/lib/auth";
+import {
+    clearOfflineSpeciesDraft,
+    loadOfflineSpeciesDraft,
+    saveOfflineSpeciesDraft,
+} from "@/lib/offline-species-draft";
 
 type SpeciesResult = {
     common_name: string | null;
@@ -58,15 +65,113 @@ type SpeciesResponse = {
     forest_knowledge: ForestKnowledge[];
 };
 
+const MAX_AUTOMATIC_RETRIES = 5;
+
 export default function SpeciesIdentification() {
     const fileInputRef = useRef<HTMLInputElement | null>(null);
+    const identifyRef = useRef<(automatic?: boolean) => Promise<void>>(async () => undefined);
+    const authBlockedRef = useRef(false);
+    const identifyingRef = useRef(false);
+    const automaticRetryCountRef = useRef(0);
+    const automaticRetryTimerRef = useRef<number | null>(null);
 
+    const [ownerId, setOwnerId] = useState<string | null>(null);
+    const [draftOwnerId, setDraftOwnerId] = useState<string | null>(null);
+    const [connectivity, setConnectivity] = useState<"Online" | "Offline">("Offline");
+    const [queuedIdentification, setQueuedIdentification] = useState(false);
+    const [syncError, setSyncError] = useState<string | null>(null);
+    const [restored, setRestored] = useState(false);
     const [selectedFile, setSelectedFile] = useState<File | null>(null);
     const [previewUrl, setPreviewUrl] = useState<string | null>(null);
     const [result, setResult] = useState<SpeciesResult | null>(null);
     const [forestKnowledge, setForestKnowledge] =
         useState<ForestKnowledge[]>([]);
     const [identifying, setIdentifying] = useState(false);
+
+    useEffect(() => {
+        const updateOwner = () => {
+            const user = getStoredUser();
+            setOwnerId(user?.role === "FIELD_OFFICER" ? user.id : null);
+        };
+        updateOwner();
+        window.addEventListener("storage", updateOwner);
+        window.addEventListener("up-forest-auth-expired", updateOwner);
+        return () => {
+            window.removeEventListener("storage", updateOwner);
+            window.removeEventListener("up-forest-auth-expired", updateOwner);
+        };
+    }, []);
+
+    useEffect(() => {
+        let cancelled = false;
+        setRestored(false);
+        setDraftOwnerId(null);
+        setSelectedFile(null);
+        setPreviewUrl((previousUrl) => {
+            if (previousUrl) URL.revokeObjectURL(previousUrl);
+            return null;
+        });
+        setResult(null);
+        setForestKnowledge([]);
+        setQueuedIdentification(false);
+        setSyncError(null);
+        automaticRetryCountRef.current = 0;
+        if (automaticRetryTimerRef.current !== null) {
+            window.clearTimeout(automaticRetryTimerRef.current);
+            automaticRetryTimerRef.current = null;
+        }
+        authBlockedRef.current = false;
+        if (!ownerId) return;
+        void loadOfflineSpeciesDraft(ownerId)
+            .then((draft) => {
+                if (cancelled || !draft) return;
+                const file = new File([draft.image], draft.fileName, { type: draft.mimeType });
+                setDraftOwnerId(ownerId);
+                setSelectedFile(file);
+                setPreviewUrl(URL.createObjectURL(file));
+                setQueuedIdentification(draft.queued);
+                setResult(draft.result as SpeciesResult | null);
+                setForestKnowledge(draft.forestKnowledge as ForestKnowledge[]);
+            })
+            .catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Unable to restore the local species image."))
+            .finally(() => { if (!cancelled) setRestored(true); });
+        return () => { cancelled = true; };
+    }, [ownerId]);
+
+    const persistSpeciesDraft = useCallback(async (
+        file: File,
+        queued: boolean,
+        currentResult: SpeciesResult | null = result,
+        knowledge: ForestKnowledge[] = forestKnowledge,
+    ) => {
+        if (!ownerId) return;
+        await saveOfflineSpeciesDraft({
+            ownerId,
+            image: file,
+            fileName: file.name,
+            mimeType: file.type,
+            queued,
+            result: currentResult,
+            forestKnowledge: knowledge,
+            updatedAt: new Date().toISOString(),
+        });
+    }, [forestKnowledge, ownerId, result]);
+
+    const scheduleAutomaticRetry = useCallback(() => {
+        automaticRetryCountRef.current += 1;
+        if (automaticRetryCountRef.current >= MAX_AUTOMATIC_RETRIES) {
+            setSyncError("Automatic retries are paused. Select Sync Now to retry this identification.");
+            return;
+        }
+        if (automaticRetryTimerRef.current !== null) {
+            window.clearTimeout(automaticRetryTimerRef.current);
+        }
+        const delay = Math.min(1_000 * 2 ** (automaticRetryCountRef.current - 1), 16_000);
+        automaticRetryTimerRef.current = window.setTimeout(() => {
+            automaticRetryTimerRef.current = null;
+            if (!authBlockedRef.current) void identifyRef.current(true);
+        }, delay);
+    }, []);
 
     const handleFileChange = (
         event: ChangeEvent<HTMLInputElement>
@@ -96,22 +201,61 @@ export default function SpeciesIdentification() {
         }
 
         setSelectedFile(file);
+        setDraftOwnerId(ownerId);
         setResult(null);
         setForestKnowledge([]);
+        setQueuedIdentification(false);
+        setSyncError(null);
+        automaticRetryCountRef.current = 0;
 
         const url = URL.createObjectURL(file);
         setPreviewUrl(url);
+        if (ownerId) {
+            void persistSpeciesDraft(file, false, null, [])
+                .catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Unable to save the local species image."));
+        }
     };
 
-    const handleIdentify = async () => {
+    const handleIdentify = useCallback(async (automatic = false) => {
+        if (automatic && authBlockedRef.current) return;
+        if (identifyingRef.current) return;
+        if (!automatic) {
+            authBlockedRef.current = false;
+            automaticRetryCountRef.current = 0;
+            setSyncError(null);
+            if (automaticRetryTimerRef.current !== null) {
+                window.clearTimeout(automaticRetryTimerRef.current);
+                automaticRetryTimerRef.current = null;
+            }
+        }
+        const activeUser = getStoredUser();
+        if (
+            !ownerId ||
+            draftOwnerId !== ownerId ||
+            activeUser?.role !== "FIELD_OFFICER" ||
+            activeUser.id !== ownerId
+        ) {
+            authBlockedRef.current = true;
+            if (!automatic) toast.error("Sign in to the original field officer account to use this saved image.");
+            return;
+        }
         if (!selectedFile) {
-            toast.error("Please select an image first.");
+            if (!automatic) toast.error("Please select an image first.");
             return;
         }
 
         setIdentifying(true);
+        identifyingRef.current = true;
 
         try {
+            const backendReachable = navigator.onLine && await checkDiaryBackendReachable();
+            if (automatic && !backendReachable) return;
+            if (!backendReachable) {
+                await persistSpeciesDraft(selectedFile, true, null, []);
+                setQueuedIdentification(true);
+                toast.info("Identification is queued and will run when the service is reachable.");
+                return;
+            }
             const formData = new FormData();
             formData.append("image", selectedFile);
 
@@ -123,24 +267,65 @@ export default function SpeciesIdentification() {
                 }
             );
 
-            if (
-                !response?.success ||
-                !response?.result
-            ) {
-                throw new Error(
-                    "Species identification failed."
-                );
+            if (!response.success) {
+                const retryable = response.code === "NETWORK" ||
+                    response.code === "TIMEOUT" ||
+                    response.code === "SERVER_ERROR" ||
+                    (response.status !== undefined && response.status >= 500);
+                if (response.status === 401 || response.status === 403) authBlockedRef.current = true;
+                if (ownerId && retryable) {
+                    await persistSpeciesDraft(selectedFile, true, null, []);
+                    setQueuedIdentification(true);
+                    if (automatic) scheduleAutomaticRetry();
+                    toast.info("Identification is queued and will run when the service is reachable.");
+                    return;
+                }
+                throw new Error(response.message || "Species identification failed.");
+            }
+            if (!response.result) {
+                throw new Error("Species identification returned an invalid response.");
             }
 
             setResult(response.result);
             setForestKnowledge(
                 response.forest_knowledge || []
             );
+            setQueuedIdentification(false);
+            setSyncError(null);
+            automaticRetryCountRef.current = 0;
+            if (automaticRetryTimerRef.current !== null) {
+                window.clearTimeout(automaticRetryTimerRef.current);
+                automaticRetryTimerRef.current = null;
+            }
+            await persistSpeciesDraft(
+                selectedFile,
+                false,
+                response.result,
+                response.forest_knowledge || [],
+            );
 
             toast.success(
                 "Species identified successfully."
             );
         } catch (error) {
+            const apiFailure = error as { code?: string; status?: number };
+            if (
+                ownerId &&
+                (apiFailure.code === "NETWORK" || apiFailure.code === "TIMEOUT" ||
+                    apiFailure.code === "SERVER_ERROR" || (apiFailure.status !== undefined && apiFailure.status >= 500))
+            ) {
+                try {
+                    await persistSpeciesDraft(selectedFile, true, null, []);
+                    setQueuedIdentification(true);
+                    if (automatic) scheduleAutomaticRetry();
+                    toast.info("Identification is queued and will run when the service is reachable.");
+                    return;
+                } catch (storageError) {
+                    toast.error(storageError instanceof Error ? storageError.message : "Unable to queue species identification.");
+                }
+            }
+            if (apiFailure.status === 401 || apiFailure.status === 403) authBlockedRef.current = true;
+            setSyncError(error instanceof Error ? error.message : "Unable to identify species.");
             console.error(
                 "Species identification error:",
                 error
@@ -152,9 +337,49 @@ export default function SpeciesIdentification() {
                     : "Unable to identify species."
             );
         } finally {
+            identifyingRef.current = false;
             setIdentifying(false);
         }
-    };
+    }, [draftOwnerId, ownerId, persistSpeciesDraft, scheduleAutomaticRetry, selectedFile]);
+    identifyRef.current = handleIdentify;
+
+    useEffect(() => {
+        if (!ownerId || !restored) return;
+        let cancelled = false;
+        const checkConnection = async () => {
+            const reachable = navigator.onLine && await checkDiaryBackendReachable();
+            if (cancelled) return;
+            setConnectivity(reachable ? "Online" : "Offline");
+            if (
+                reachable &&
+                queuedIdentification &&
+                !syncError &&
+                !identifyingRef.current &&
+                automaticRetryTimerRef.current === null &&
+                !authBlockedRef.current &&
+                automaticRetryCountRef.current < MAX_AUTOMATIC_RETRIES
+            ) {
+                void identifyRef.current(true);
+            }
+        };
+        const onOffline = () => setConnectivity("Offline");
+        window.addEventListener("online", checkConnection);
+        window.addEventListener("offline", onOffline);
+        const interval = window.setInterval(checkConnection, 30_000);
+        void checkConnection();
+        return () => {
+            cancelled = true;
+            window.removeEventListener("online", checkConnection);
+            window.removeEventListener("offline", onOffline);
+            window.clearInterval(interval);
+        };
+    }, [ownerId, queuedIdentification, restored, syncError]);
+
+    useEffect(() => () => {
+        if (automaticRetryTimerRef.current !== null) {
+            window.clearTimeout(automaticRetryTimerRef.current);
+        }
+    }, []);
 
     const handleReset = () => {
         if (previewUrl) {
@@ -165,11 +390,33 @@ export default function SpeciesIdentification() {
         setPreviewUrl(null);
         setResult(null);
         setForestKnowledge([]);
+        setQueuedIdentification(false);
+        setSyncError(null);
+        automaticRetryCountRef.current = 0;
+        if (automaticRetryTimerRef.current !== null) {
+            window.clearTimeout(automaticRetryTimerRef.current);
+            automaticRetryTimerRef.current = null;
+        }
+        authBlockedRef.current = false;
+        if (ownerId) {
+            void clearOfflineSpeciesDraft(ownerId)
+                .catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Unable to clear the local species image."));
+        }
 
         if (fileInputRef.current) {
             fileInputRef.current.value = "";
         }
     };
+
+    const syncState = identifying
+        ? "Syncing"
+        : syncError
+            ? "Sync Failed"
+            : queuedIdentification
+                ? "Pending Sync"
+                : connectivity === "Online"
+                    ? result ? "Synced" : "Online"
+                    : "Offline";
 
     const confidencePercentage = result
         ? Math.round(result.confidence * 100)
@@ -207,6 +454,21 @@ export default function SpeciesIdentification() {
 
     return (
         <section className="rounded-2xl border bg-white p-5 shadow-sm">
+            <div className="mb-4 flex flex-wrap items-center gap-3 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-white">
+                <span className="font-medium">{syncState}</span>
+                <span>{queuedIdentification ? "1 pending identification" : "0 pending identifications"}</span>
+                {queuedIdentification && (
+                    <button
+                        type="button"
+                        onClick={() => void handleIdentify()}
+                        disabled={identifying}
+                        className="rounded-md border border-white/60 px-3 py-1.5 font-medium text-white transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                        Sync Now
+                    </button>
+                )}
+                {syncError && <span role="status" className="basis-full text-amber-300">{syncError}</span>}
+            </div>
             <div className="mb-5 flex items-start justify-between gap-4">
                 <div>
                     <div className="flex items-center gap-2">
@@ -300,7 +562,7 @@ export default function SpeciesIdentification() {
 
                         <button
                             type="button"
-                            onClick={handleIdentify}
+                            onClick={() => void handleIdentify()}
                             disabled={identifying}
                             className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 py-3 text-sm font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60"
                         >

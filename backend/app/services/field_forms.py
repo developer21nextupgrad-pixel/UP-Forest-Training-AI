@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from datetime import datetime
 from datetime import date
 
 from app.core.config import Settings
@@ -188,6 +190,108 @@ Return ONLY the JSON object.
 
         return fields, confidence
 
+    async def extract_daily_diary(self, text: str) -> dict:
+            """Extract Daily Diary fields from an officer's narrative."""
+
+            clean_text = text.strip()
+            if not clean_text:
+                raise ValueError("Daily diary text cannot be empty.")
+
+            prompt = """
+
+Extract Daily Diary fields from the officer's narrative.
+
+Rules:
+- Return only valid JSON. Do not include markdown.
+- Never invent information.
+- Use null for missing text/date fields.
+- Use [] if no activities are mentioned.
+- Preserve the language and meaning of the narrative.
+- Extract the diary date only when explicitly stated in the narrative.
+- Do not use today's date unless explicitly stated.
+- Return diary_date strictly in DD-MM-YYYY format.
+- Example: "22 October 2026" becomes "22-10-2026".
+- If a date is explicitly mentioned, extract it exactly.
+- Convert dates such as "22 October 2026" to "22-10-2026".
+- Never return an explicitly mentioned date as null.
+- If the date is not explicitly mentioned, return null.
+- The description field must contain a concise summary of the
+  field activities, not a copy of the complete original narrative.
+- Extract only information supported by the narrative.
+
+Return exactly this JSON structure:
+{
+    "diary_date": null,
+    "subject": null,
+    "description": null,
+    "location": null,
+    "activities": [],
+    "observations": null,
+    "additional_remarks": null
+}
+"""
+
+
+            raw_response = await self.llm.generate(
+                system=prompt,
+                user=clean_text,
+            )
+            data = self._parse_json(raw_response)
+
+
+            # Deterministically extract an explicitly mentioned date.
+            # This avoids relying entirely on the AI model for dates.
+            date_patterns = [
+                (
+                    r"\b(\d{1,2})\s+"
+                    r"(January|February|March|April|May|June|July|August|"
+                    r"September|October|November|December)\s+(\d{4})\b",
+                    "%d %B %Y",
+                ),
+                (r"\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b", None),
+            ]
+
+            for pattern, date_format in date_patterns:
+                match = re.search(pattern, clean_text, re.IGNORECASE)
+
+                if not match:
+                    continue
+
+                try:
+                    if date_format:
+                        parsed_date = datetime.strptime(
+                            " ".join(match.groups()).title(),
+                            date_format,
+                        )
+                    else:
+                        day, month, year = map(int, match.groups())
+                        parsed_date = datetime(year, month, day)
+
+                    data["diary_date"] = parsed_date.strftime("%d-%m-%Y")
+                    break
+
+                except ValueError:
+                    continue
+
+
+            allowed_fields = {
+                "diary_date",
+                "subject",
+                "description",
+                "location",
+                "activities",
+                "observations",
+                "additional_remarks",
+            }
+
+            result = {key: data.get(key) for key in allowed_fields}
+            result["activities"] = (
+                result["activities"]
+                if isinstance(result["activities"], list)
+                else []
+            )
+            return result
+
     @staticmethod
     def _parse_json(raw_response: str) -> dict:
         """Parse JSON safely from the LLM response."""
@@ -225,7 +329,7 @@ Return ONLY the JSON object.
             )
 
         return payload
-    
+
 async def extract_offence_seizure_report(
     text: str,
     settings: Settings,

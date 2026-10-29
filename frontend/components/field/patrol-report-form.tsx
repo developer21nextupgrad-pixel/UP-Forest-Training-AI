@@ -10,10 +10,22 @@ import {
     Send,
     Trash2,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { apiRequest } from "@/lib/api";
+import {
+    createFieldLocalId,
+    enqueueOfflineFieldOperation,
+    fieldCreateOperationId,
+    fieldSyncableFailure,
+    getOfflineFormRecord,
+    loadOfflineFormDraft,
+    saveOfflineFormDraft,
+    useOfflineFieldForm,
+    type OfflineFieldRecord,
+} from "@/lib/offline-field-forms";
+import { OfflineFieldFormControls } from "./offline-field-form-controls";
 
 type PatrolReportFields = {
     patrol_date: string | null;
@@ -131,6 +143,9 @@ export function PatrolReportForm({
     initialDraft,
     onSaved,
 }: Props) {
+    const offline = useOfflineFieldForm("PATROL_REPORT");
+    const localId = useRef("");
+    const previousOwnerId = useRef<string | null>(null);
     const [description, setDescription] = useState("");
 
     const [fields, setFields] =
@@ -154,6 +169,87 @@ export function PatrolReportForm({
         useState<string | null>(null);
 
     const [isSubmitted, setIsSubmitted] = useState(false);
+    const [queuedCreate, setQueuedCreate] = useState(false);
+    const [offlineDraftRestored, setOfflineDraftRestored] = useState(false);
+
+    useEffect(() => {
+        if (!localId.current) localId.current = initialDraft?.report_id ?? createFieldLocalId();
+    }, [initialDraft]);
+
+    useEffect(() => {
+        if (previousOwnerId.current !== offline.ownerId) {
+            const hadPreviousOwner = previousOwnerId.current !== null;
+            previousOwnerId.current = offline.ownerId;
+            if (!initialDraft || hadPreviousOwner) {
+                setFields(EMPTY_FIELDS);
+                setDescription("");
+                setConfidence(null);
+                setIsExtracted(false);
+                setReportId(null);
+                setSavedReportId(null);
+                setQueuedCreate(false);
+                setIsSubmitted(false);
+                localId.current = offline.ownerId ? createFieldLocalId() : "";
+            }
+        }
+        setOfflineDraftRestored(false);
+        if (!offline.ownerId) return;
+        if (initialDraft) {
+            setOfflineDraftRestored(true);
+            return;
+        }
+        let cancelled = false;
+        void loadOfflineFormDraft<Record<string, unknown>>(offline.ownerId, "PATROL_REPORT", "active")
+            .then((draft) => {
+                if (cancelled || !draft) return;
+                const snapshot = draft.snapshot;
+                if (typeof snapshot.localId === "string") localId.current = snapshot.localId;
+                if (snapshot.fields && typeof snapshot.fields === "object") setFields(snapshot.fields as PatrolReportFields);
+                if (typeof snapshot.description === "string") setDescription(snapshot.description);
+                if (typeof snapshot.confidence === "number" || snapshot.confidence === null) setConfidence(snapshot.confidence as number | null);
+                setIsExtracted(snapshot.isExtracted === true);
+                if (typeof snapshot.reportId === "string") setReportId(snapshot.reportId);
+                if (typeof snapshot.savedReportId === "string") setSavedReportId(snapshot.savedReportId);
+                if (snapshot.queuedCreate === true) setQueuedCreate(true);
+                toast.info("Restored your locally saved patrol report draft.");
+            })
+            .catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Unable to restore the local patrol draft."))
+            .finally(() => { if (!cancelled) setOfflineDraftRestored(true); });
+        return () => { cancelled = true; };
+    }, [initialDraft, offline.ownerId]);
+
+    useEffect(() => {
+        if (!offline.ownerId || !offlineDraftRestored || !localId.current || isSubmitted) return;
+        void saveOfflineFormDraft(offline.ownerId, "PATROL_REPORT", "active", {
+            localId: localId.current,
+            fields: fields as unknown as Record<string, unknown>,
+            description,
+            confidence,
+            isExtracted,
+            reportId,
+            savedReportId,
+            queuedCreate,
+        }).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Unable to save the local patrol draft."));
+    }, [confidence, description, fields, isExtracted, isSubmitted, offline.ownerId, offlineDraftRestored, queuedCreate, reportId, savedReportId]);
+
+    useEffect(() => {
+        if (!offline.ownerId || !localId.current) return;
+        const refreshRecord = () => {
+            void getOfflineFormRecord(offline.ownerId!, "PATROL_REPORT", localId.current)
+                .then((record) => {
+                    if (!record) return;
+                    if (record.serverId) {
+                        setReportId(record.serverId);
+                        setSavedReportId(record.serverId);
+                        setQueuedCreate(false);
+                    }
+                    if (record.status === "SUBMITTED") setIsSubmitted(true);
+                })
+                .catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Unable to refresh patrol sync status."));
+        };
+        window.addEventListener("up-forest-offline-queue-changed", refreshRecord);
+        return () => window.removeEventListener("up-forest-offline-queue-changed", refreshRecord);
+    }, [offline.ownerId]);
 
     /**
      * Load an existing saved draft into the form.
@@ -191,6 +287,7 @@ export function PatrolReportForm({
 
         setReportId(initialDraft.report_id);
         setSavedReportId(initialDraft.report_id);
+        localId.current = initialDraft.report_id;
 
         setIsExtracted(true);
         setIsSubmitted(initialDraft.status === "SUBMITTED");
@@ -379,6 +476,28 @@ export function PatrolReportForm({
             };
 
             const isUpdating = Boolean(reportId);
+            const operationId = fieldCreateOperationId("PATROL_REPORT", localId.current || (localId.current = createFieldLocalId()));
+            if (offline.ownerId && (!navigator.onLine || (queuedCreate && !reportId))) {
+                const record: OfflineFieldRecord = {
+                    ownerId: offline.ownerId,
+                    module: "PATROL_REPORT",
+                    localId: localId.current,
+                    serverId: reportId,
+                    payload,
+                    status: "DRAFT",
+                    syncError: null,
+                    updatedAt: new Date().toISOString(),
+                };
+                await enqueueOfflineFieldOperation(
+                    offline.ownerId,
+                    "PATROL_REPORT",
+                    record,
+                    reportId ? "UPDATE" : "CREATE",
+                );
+                if (!reportId) setQueuedCreate(true);
+                toast.info("Patrol report draft is saved locally and will sync when the service is available.");
+                return;
+            }
 
             const result =
                 await apiRequest<PatrolReportSaveResponse>(
@@ -389,11 +508,27 @@ export function PatrolReportForm({
                         method: isUpdating
                             ? "PUT"
                             : "POST",
-                        body: JSON.stringify(payload),
+                        body: JSON.stringify(isUpdating ? payload : { ...payload, client_operation_id: operationId }),
                     },
                 );
 
             if (!result.success) {
+                if (offline.ownerId && fieldSyncableFailure(result)) {
+                    const record: OfflineFieldRecord = {
+                        ownerId: offline.ownerId,
+                        module: "PATROL_REPORT",
+                        localId: localId.current,
+                        serverId: reportId,
+                        payload,
+                        status: "DRAFT",
+                        syncError: null,
+                        updatedAt: new Date().toISOString(),
+                    };
+                    await enqueueOfflineFieldOperation(offline.ownerId, "PATROL_REPORT", record, isUpdating ? "UPDATE" : "CREATE");
+                    setQueuedCreate(!isUpdating);
+                    toast.info("Patrol report draft is saved locally and will sync when the service is available.");
+                    return;
+                }
                 throw new Error(
                     result.message ||
                         "Unable to save patrol report draft.",
@@ -402,6 +537,7 @@ export function PatrolReportForm({
 
             setReportId(result.report_id);
             setSavedReportId(result.report_id);
+            setQueuedCreate(false);
 
             toast.success(
                 isUpdating
@@ -428,7 +564,7 @@ export function PatrolReportForm({
             return;
         }
 
-        if (!savedReportId) {
+        if (!savedReportId && !queuedCreate) {
             toast.error(
                 "Please save the patrol report draft before submitting.",
             );
@@ -449,6 +585,26 @@ export function PatrolReportForm({
         setIsSubmitting(true);
 
         try {
+            if (offline.ownerId && (!navigator.onLine || (queuedCreate && !savedReportId))) {
+                const record: OfflineFieldRecord = {
+                    ownerId: offline.ownerId,
+                    module: "PATROL_REPORT",
+                    localId: localId.current,
+                    serverId: savedReportId,
+                    payload: {
+                        ...fields,
+                        team_members: fields.team_members.map((member) => member.trim()).filter(Boolean),
+                        source_text: description.trim() || null,
+                        ai_confidence: confidence,
+                    },
+                    status: "PENDING_SUBMISSION",
+                    syncError: null,
+                    updatedAt: new Date().toISOString(),
+                };
+                await enqueueOfflineFieldOperation(offline.ownerId, "PATROL_REPORT", record, "SUBMIT");
+                toast.info("Submission is pending sync and server validation.");
+                return;
+            }
             const result =
                 await apiRequest<PatrolReportSubmitResponse>(
                     `/api/v1/field/forms/patrol/${savedReportId}/submit`,
@@ -458,6 +614,26 @@ export function PatrolReportForm({
                 );
 
             if (!result.success) {
+                if (offline.ownerId && fieldSyncableFailure(result)) {
+                    const record: OfflineFieldRecord = {
+                        ownerId: offline.ownerId,
+                        module: "PATROL_REPORT",
+                        localId: localId.current,
+                        serverId: savedReportId,
+                        payload: {
+                            ...fields,
+                            team_members: fields.team_members.map((member) => member.trim()).filter(Boolean),
+                            source_text: description.trim() || null,
+                            ai_confidence: confidence,
+                        },
+                        status: "PENDING_SUBMISSION",
+                        syncError: null,
+                        updatedAt: new Date().toISOString(),
+                    };
+                    await enqueueOfflineFieldOperation(offline.ownerId, "PATROL_REPORT", record, "SUBMIT");
+                    toast.info("Submission is pending sync and server validation.");
+                    return;
+                }
                 throw new Error(
                     result.message ||
                         "Unable to submit patrol report.",
@@ -565,6 +741,9 @@ export function PatrolReportForm({
 
     return (
         <section className="rounded-2xl border border-border bg-card text-card-foreground shadow-sm">
+            <div className="border-b border-border px-5 py-3">
+                <OfflineFieldFormControls {...offline} />
+            </div>
             {/* Header */}
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4">
                 <div>
@@ -1246,11 +1425,11 @@ export function PatrolReportForm({
                                             disabled={
                                                 isSubmitting ||
                                                 isSaving ||
-                                                !savedReportId
+                                                (!savedReportId && !queuedCreate)
                                             }
                                             className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
                                             title={
-                                                !savedReportId
+                                                !savedReportId && !queuedCreate
                                                     ? "Save the draft before submitting."
                                                     : "Submit patrol report"
                                             }
