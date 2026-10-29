@@ -446,6 +446,12 @@ async def receive_meta_webhook(
     session: Annotated[AsyncSession, Depends(get_db_session)],
     signature: str | None = Header(default=None, alias="X-Hub-Signature-256"),
 ) -> dict[str, bool]:
+    
+    logger.warning(
+        "WhatsApp webhook config status: webhook=%s assistant=%s",
+        settings.is_whatsapp_webhook_configured,
+        settings.is_whatsapp_configured,
+    )
     if not settings.is_whatsapp_webhook_configured:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
