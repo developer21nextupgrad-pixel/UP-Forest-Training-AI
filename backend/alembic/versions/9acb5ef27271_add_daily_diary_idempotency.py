@@ -7,8 +7,13 @@ Create Date: 2026-10-26 13:14:00.000000
 
 from typing import Sequence, Union
 
-from alembic import op
 import sqlalchemy as sa
+
+from app.db.migration_compat import (
+    add_column_if_compatible,
+    create_unique_constraint_if_compatible,
+    refuse_unsafe_downgrade,
+)
 
 
 revision: str = "9acb5ef27271"
@@ -18,11 +23,11 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column(
+    add_column_if_compatible(
         "daily_diaries",
         sa.Column("client_operation_id", sa.String(length=100), nullable=True),
     )
-    op.create_unique_constraint(
+    create_unique_constraint_if_compatible(
         "uq_daily_diary_officer_operation",
         "daily_diaries",
         ["officer_id", "client_operation_id"],
@@ -30,9 +35,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_constraint(
-        "uq_daily_diary_officer_operation",
-        "daily_diaries",
-        type_="unique",
-    )
-    op.drop_column("daily_diaries", "client_operation_id")
+    refuse_unsafe_downgrade(revision)

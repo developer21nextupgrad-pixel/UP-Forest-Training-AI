@@ -2,6 +2,8 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+
 from app.services.rag_schemas import RetrievalResult
 from app.services.rag_service import ContentIntelligenceService
 
@@ -78,7 +80,5 @@ def test_content_intelligence_handles_retrieval_and_llm_failures():
     assert "couldn't generate" in answer
 
     service.retriever = SimpleNamespace(search=AsyncMock(side_effect=RuntimeError("db down")))
-    _, answer, grounded, sources = asyncio.run(service.answer("question", {}))
-    assert grounded is False
-    assert sources == []
-    assert "couldn't retrieve" in answer
+    with pytest.raises(RuntimeError, match="db down"):
+        asyncio.run(service.answer("question", {}))

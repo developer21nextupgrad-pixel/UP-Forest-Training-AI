@@ -13,9 +13,9 @@ export async function loadDailyDiaryList<T>(): Promise<T[]> {
     if (process.env.NODE_ENV === "development") {
       console.error("[Daily Diary] Failed to load diary list.", {
         path: DAILY_DIARY_LIST_PATH,
-        status: response.status,
-        code: response.code,
-        message: response.message,
+        status: response.status ?? null,
+        code: response.code ?? "UNKNOWN",
+        message: response.message || "The request failed without a response message.",
       });
     }
     const safeMessage =

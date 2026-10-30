@@ -7,8 +7,13 @@ Create Date: 2026-10-26 18:55:00.000000
 
 from typing import Sequence, Union
 
-from alembic import op
 import sqlalchemy as sa
+
+from app.db.migration_compat import (
+    create_index_if_compatible,
+    create_table_if_compatible,
+    refuse_unsafe_downgrade,
+)
 
 
 revision: str = "6c8d4f21a930"
@@ -18,7 +23,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.create_table(
+    create_table_if_compatible(
         "whatsapp_officer_links",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("user_id", sa.Uuid(), nullable=False),
@@ -44,12 +49,12 @@ def upgrade() -> None:
         sa.UniqueConstraint("phone_number", name="uq_whatsapp_officer_phone"),
         sa.UniqueConstraint("user_id", name="uq_whatsapp_officer_user"),
     )
-    op.create_index(
+    create_index_if_compatible(
         "ix_whatsapp_officer_links_user_id",
         "whatsapp_officer_links",
         ["user_id"],
     )
-    op.create_table(
+    create_table_if_compatible(
         "whatsapp_inbound_messages",
         sa.Column("provider_message_id", sa.String(length=200), nullable=False),
         sa.Column("sender_phone", sa.String(length=20), nullable=False),
@@ -74,8 +79,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_table("whatsapp_inbound_messages")
-    op.drop_index(
-        "ix_whatsapp_officer_links_user_id", table_name="whatsapp_officer_links"
-    )
-    op.drop_table("whatsapp_officer_links")
+    refuse_unsafe_downgrade(revision)

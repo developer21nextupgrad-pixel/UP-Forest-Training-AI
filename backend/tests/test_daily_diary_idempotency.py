@@ -2,6 +2,7 @@ from uuid import UUID, uuid4
 from io import BytesIO
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from starlette.datastructures import Headers, UploadFile
@@ -12,6 +13,7 @@ from app.api.field import (
     save_incident_report_draft,
     save_offence_seizure_report_draft,
     save_patrol_report_draft,
+    update_incident_report_draft,
     submit_daily_diary,
     submit_incident_report,
     submit_offence_seizure_report,
@@ -201,6 +203,44 @@ async def test_remaining_field_form_create_retries_are_idempotent_and_officer_sc
         )
         assert incident_retry.incident_id == incident_first.incident_id
         assert await session.scalar(select(func.count()).select_from(IncidentReport)) == 1
+
+        recovered_incident = await update_incident_report_draft(
+            uuid4(),
+            IncidentReportSaveRequest(
+                incident_description="Recovered incident draft",
+                client_operation_id="incident:create:stable",
+            ),
+            officer,
+            session,
+        )
+        assert recovered_incident.incident_id == incident_first.incident_id
+        stored_incident = await session.get(
+            IncidentReport,
+            UUID(incident_first.incident_id),
+        )
+        assert stored_incident.incident_description == "Recovered incident draft"
+        assert await session.scalar(select(func.count()).select_from(IncidentReport)) == 1
+        with pytest.raises(HTTPException) as unauthorized_recovery:
+            await update_incident_report_draft(
+                uuid4(),
+                IncidentReportSaveRequest(
+                    incident_description="Must not cross officer boundary",
+                    client_operation_id="incident:create:stable",
+                ),
+                other,
+                session,
+            )
+        assert unauthorized_recovery.value.status_code == 404
+        with pytest.raises(HTTPException) as missing_incident:
+            await update_incident_report_draft(
+                uuid4(),
+                IncidentReportSaveRequest(
+                    incident_description="No matching server report",
+                ),
+                officer,
+                session,
+            )
+        assert missing_incident.value.status_code == 404
 
         offence_payload = OffenceSeizureReportCreate(
             fields=OffenceSeizureReportFields(description="Offence draft"),

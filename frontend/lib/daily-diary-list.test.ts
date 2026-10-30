@@ -46,6 +46,31 @@ describe("Daily Diary list loading", () => {
     vi.unstubAllEnvs();
   });
 
+  it("logs network failures with an explicit missing HTTP status", async () => {
+    vi.stubEnv("NODE_ENV", "development");
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mockedApiRequest.mockResolvedValue({
+      success: false,
+      code: "NETWORK",
+      message: "Unable to connect to the server. Please try again.",
+    });
+
+    await expect(loadDailyDiaryList()).rejects.toThrow(
+      "Unable to connect to the server. Please try again.",
+    );
+    expect(diagnostic).toHaveBeenCalledWith(
+      "[Daily Diary] Failed to load diary list.",
+      expect.objectContaining({
+        path: "/api/v1/field/forms/daily-diary",
+        status: null,
+        code: "NETWORK",
+        message: "Unable to connect to the server. Please try again.",
+      }),
+    );
+    diagnostic.mockRestore();
+    vi.unstubAllEnvs();
+  });
+
   it("rejects a successful response with an invalid diary-list shape", async () => {
     mockedApiRequest.mockResolvedValue({
       success: true,

@@ -10,6 +10,12 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
+from app.db.migration_compat import (
+    create_index_if_compatible,
+    create_table_if_compatible,
+    refuse_unsafe_downgrade,
+)
+
 
 revision: str = "cd4e6ce2549a"
 down_revision: Union[str, Sequence[str], None] = "2df3157e4b50"
@@ -18,7 +24,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.create_table(
+    create_table_if_compatible(
         "offence_seizure_reports",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("officer_id", sa.Uuid(), nullable=False),
@@ -101,35 +107,35 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
 
-    op.create_index(
+    create_index_if_compatible(
         op.f("ix_offence_seizure_reports_incident_reference_id"),
         "offence_seizure_reports",
         ["incident_reference_id"],
         unique=False,
     )
 
-    op.create_index(
+    create_index_if_compatible(
         op.f("ix_offence_seizure_reports_officer_id"),
         "offence_seizure_reports",
         ["officer_id"],
         unique=False,
     )
 
-    op.create_index(
+    create_index_if_compatible(
         op.f("ix_offence_seizure_reports_review_status"),
         "offence_seizure_reports",
         ["review_status"],
         unique=False,
     )
 
-    op.create_index(
+    create_index_if_compatible(
         op.f("ix_offence_seizure_reports_reviewed_by"),
         "offence_seizure_reports",
         ["reviewed_by"],
         unique=False,
     )
 
-    op.create_index(
+    create_index_if_compatible(
         op.f("ix_offence_seizure_reports_status"),
         "offence_seizure_reports",
         ["status"],
@@ -138,29 +144,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        op.f("ix_offence_seizure_reports_status"),
-        table_name="offence_seizure_reports",
-    )
-
-    op.drop_index(
-        op.f("ix_offence_seizure_reports_reviewed_by"),
-        table_name="offence_seizure_reports",
-    )
-
-    op.drop_index(
-        op.f("ix_offence_seizure_reports_review_status"),
-        table_name="offence_seizure_reports",
-    )
-
-    op.drop_index(
-        op.f("ix_offence_seizure_reports_officer_id"),
-        table_name="offence_seizure_reports",
-    )
-
-    op.drop_index(
-        op.f("ix_offence_seizure_reports_incident_reference_id"),
-        table_name="offence_seizure_reports",
-    )
-
-    op.drop_table("offence_seizure_reports")
+    refuse_unsafe_downgrade(revision)

@@ -63,8 +63,14 @@ async def rag_chat(
         select(Enrollment.subject_id).where(Enrollment.student_id == profile.id, Enrollment.status == EnrollmentStatus.ACTIVE)
     )).scalars().all()]
     try:
-        results = await RAGService(session, settings).retrieve(payload.question, {"_authorized_subject_ids": subject_ids,"training_only": True,
-})
+        results = await RAGService(session, settings).retrieve(
+            payload.question,
+            {
+                "requester_role": "STUDENT",
+                "_authorized_subject_ids": subject_ids,
+                "training_only": True,
+            },
+        )
     except Exception as exc:
         logger.exception("Legacy RAG retrieval failed")
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Unable to retrieve from the document index.") from exc

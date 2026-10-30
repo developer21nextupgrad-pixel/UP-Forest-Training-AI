@@ -49,16 +49,10 @@ class ContentIntelligenceService:
         try:
             results = await self.retriever.search(normalized, filters)
         except Exception:
-            logger.exception("Content intelligence retrieval failed for query=%r", normalized)
-            return (
-                [],
-                "I couldn't retrieve relevant information from the uploaded documents.",
-                False,
-                [],
-            )
+            logger.exception("Content intelligence retrieval failed")
+            raise
         logger.info(
-            "Content intelligence query normalized=%r retrieved=%d",
-            normalized,
+            "Content intelligence retrieval completed retrieved=%d",
             len(results),
         )
         if not results:
@@ -295,6 +289,7 @@ class TutorService:
         authorized_subject_ids = await self._validate_scope(student.id, effective_subject_id, effective_chapter_id)
         query = contextualize_query(message, history)
         filters = {
+            "requester_role": "STUDENT",
             "_authorized_subject_ids": authorized_subject_ids,
             "query_language": detect_content_language(query),
             "subject_id": str(effective_subject_id) if effective_subject_id else None,

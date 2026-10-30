@@ -8,8 +8,13 @@ Create Date: 2026-09-24 15:31:15.402444
 
 from typing import Sequence, Union
 
-from alembic import op
 import sqlalchemy as sa
+
+from app.db.migration_compat import (
+    create_index_if_compatible,
+    create_table_if_compatible,
+    refuse_unsafe_downgrade,
+)
 
 
 # revision identifiers, used by Alembic.
@@ -20,7 +25,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.create_table(
+    create_table_if_compatible(
         "field_patrol_reports",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("officer_id", sa.Uuid(), nullable=False),
@@ -61,14 +66,14 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
 
-    op.create_index(
+    create_index_if_compatible(
         "ix_field_patrol_reports_officer_id",
         "field_patrol_reports",
         ["officer_id"],
         unique=False,
     )
 
-    op.create_index(
+    create_index_if_compatible(
         "ix_field_patrol_reports_status",
         "field_patrol_reports",
         ["status"],
@@ -77,14 +82,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "ix_field_patrol_reports_status",
-        table_name="field_patrol_reports",
-    )
-
-    op.drop_index(
-        "ix_field_patrol_reports_officer_id",
-        table_name="field_patrol_reports",
-    )
-
-    op.drop_table("field_patrol_reports")
+    refuse_unsafe_downgrade(revision)

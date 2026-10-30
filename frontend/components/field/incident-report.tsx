@@ -685,7 +685,7 @@ export function IncidentReport() {
                 editingId ? `/api/v1/field/forms/incident/${editingId}` : "/api/v1/field/forms/incident",
                 {
                     method: editingId ? "PUT" : "POST",
-                    body: JSON.stringify(editingId ? payload : { ...payload, client_operation_id: createId }),
+                    body: JSON.stringify({ ...payload, client_operation_id: createId }),
                 },
             );
 
@@ -704,7 +704,7 @@ export function IncidentReport() {
                 throw new Error(response.message ?? "Unable to save incident report draft.");
             }
 
-            if (!editingId) setEditingId(response.data.incident_id);
+            setEditingId(response.data.incident_id);
             setQueuedCreate(false);
             toast.success(editingId ? "Incident report draft updated." : "Incident report draft saved.");
 

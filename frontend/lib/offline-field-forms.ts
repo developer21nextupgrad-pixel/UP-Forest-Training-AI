@@ -222,7 +222,9 @@ export async function enqueueOfflineFieldOperation(
       ? undefined
       : {
           ...record.payload,
-          ...(kind === "CREATE" ? { client_operation_id: fieldCreateOperationId(module, record.localId) } : {}),
+          ...(kind === "CREATE" || (module === "INCIDENT_REPORT" && kind === "UPDATE")
+            ? { client_operation_id: fieldCreateOperationId(module, record.localId) }
+            : {}),
         };
     await requestValue(operationStore.put({
       ownerId, module, id: operationId, localId: record.localId, kind, payload,
@@ -358,12 +360,17 @@ async function syncOne(operation: Operation): Promise<"ok" | "auth" | "failed"> 
     return "failed";
   }
   const config = CONFIG[operation.module];
+  const isIncidentUpdate =
+    operation.module === "INCIDENT_REPORT" && operation.kind === "UPDATE";
+  const isIncidentCreateRecovery = isIncidentUpdate && !record.serverId;
   const operationKind: FieldOperationKind =
-    operation.kind === "UPDATE" && !record.serverId ? "CREATE" : operation.kind;
+    operation.kind === "UPDATE" && !record.serverId && !isIncidentUpdate
+      ? "CREATE"
+      : operation.kind;
   let path: string;
   let method: string;
   let body: string | undefined;
-  if (operationKind === "CREATE") {
+  if (operationKind === "CREATE" || isIncidentCreateRecovery) {
     path = config.path;
     method = "POST";
     body = JSON.stringify({
@@ -377,7 +384,17 @@ async function syncOne(operation: Operation): Promise<"ok" | "auth" | "failed"> 
     }
     path = `${config.path}/${record.serverId}`;
     method = "PUT";
-    body = JSON.stringify(operation.payload);
+    body = JSON.stringify(
+      isIncidentUpdate
+        ? {
+            ...operation.payload,
+            client_operation_id: fieldCreateOperationId(
+              operation.module,
+              operation.localId,
+            ),
+          }
+        : operation.payload,
+    );
   } else if (operation.kind === "SUBMIT") {
     if (!record.serverId) {
       await markOperation(operation.ownerId, operation.module, { ...operation, status: "FAILED", error: "Save the draft before submitting it." });
@@ -428,14 +445,41 @@ async function syncOne(operation: Operation): Promise<"ok" | "auth" | "failed"> 
       if (operation.file.description) formData.append("description", operation.file.description);
       requestBody = formData;
     }
-    const response = await apiRequest<Record<string, unknown>>(path, { method, body: requestBody, timeoutMs: 15_000 });
+    let response = await apiRequest<Record<string, unknown>>(path, { method, body: requestBody, timeoutMs: 15_000 });
+    if (
+      isIncidentUpdate &&
+      method === "PUT" &&
+      response.status === 404 &&
+      response.message === "Incident report not found."
+    ) {
+      path = config.path;
+      method = "POST";
+      body = JSON.stringify({
+        ...operation.payload,
+        client_operation_id: fieldCreateOperationId(
+          operation.module,
+          operation.localId,
+        ),
+      });
+      response = await apiRequest<Record<string, unknown>>(path, {
+        method,
+        body,
+        timeoutMs: 15_000,
+      });
+    }
     if (response.success) {
       let serverId = record.serverId;
-      if (operationKind === "CREATE") {
+      if (
+        operationKind === "CREATE" ||
+        isIncidentUpdate
+      ) {
         const id = response.data[config.idField];
         if (typeof id !== "string" || !id) {
+          const error = operation.module === "INCIDENT_REPORT"
+            ? "Server confirmed the save without returning the incident ID; local data was retained."
+            : "Server confirmed the save without returning a report ID; local data was retained.";
           await markOperation(operation.ownerId, operation.module, {
-            ...operation, status: "FAILED", error: "Server confirmed the save without returning a report ID; local data was retained.",
+            ...operation, status: "FAILED", error,
           });
           return "failed";
         }

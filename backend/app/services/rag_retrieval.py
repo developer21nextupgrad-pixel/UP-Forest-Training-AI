@@ -5,11 +5,12 @@ import logging
 from collections import defaultdict
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.models import Book, Document, DocumentChunk, DocumentVersion
+from app.models.enums import DocumentType, ProcessingStatus
 from app.services.ingestion.embedding import MistralEmbeddingProvider
 from app.services.ingestion.vector_store import get_vector_store
 from app.services.rag_bm25 import BM25Index
@@ -24,7 +25,11 @@ async def _current_chunk_records(session: AsyncSession) -> list[dict]:
         .join(DocumentVersion, DocumentChunk.document_version_id == DocumentVersion.id)
         .join(Document, DocumentChunk.document_id == Document.id)
         .join(Book, Document.book_id == Book.id)
-        .where(DocumentVersion.is_current.is_(True), Document.archived_at.is_(None))
+        .where(
+            DocumentVersion.is_current.is_(True),
+            Document.processing_status == ProcessingStatus.READY,
+            Document.archived_at.is_(None),
+        )
     )
     records = []
     for chunk, doc, book in result.all():
@@ -81,7 +86,16 @@ class BM25Manager:
         return cls._instance
 
     async def ensure_built(self, session: AsyncSession) -> None:
-        count_result = await session.execute(select(DocumentChunk.id).join(DocumentVersion).where(DocumentVersion.is_current.is_(True)))
+        count_result = await session.execute(
+            select(DocumentChunk.id)
+            .join(DocumentVersion)
+            .join(Document, DocumentChunk.document_id == Document.id)
+            .where(
+                DocumentVersion.is_current.is_(True),
+                Document.processing_status == ProcessingStatus.READY,
+                Document.archived_at.is_(None),
+            )
+        )
         ids = list(count_result.scalars().all())
         signature = (len(ids), hash(tuple(str(x) for x in ids)))
         if self._signature == signature and self.index.documents:
@@ -107,7 +121,11 @@ async def _allowed_chunk_ids(session: AsyncSession, filters: dict) -> set[str] |
         .join(DocumentVersion, DocumentChunk.document_version_id == DocumentVersion.id)
         .join(Document, DocumentChunk.document_id == Document.id)
         .join(Book, Document.book_id == Book.id)
-        .where(DocumentVersion.is_current.is_(True), Document.archived_at.is_(None))
+        .where(
+            DocumentVersion.is_current.is_(True),
+            Document.processing_status == ProcessingStatus.READY,
+            Document.archived_at.is_(None),
+        )
     )
     if filters.get("subject_id"):
         stmt = stmt.where(Book.subject_id == UUID(filters["subject_id"]))
@@ -118,7 +136,10 @@ async def _allowed_chunk_ids(session: AsyncSession, filters: dict) -> set[str] |
     if filters.get("book_id"):
         stmt = stmt.where(Book.id == UUID(filters["book_id"]))
         
-    if filters.get("domain"):
+    domains = filters.get("domains")
+    if domains:
+        stmt = stmt.where(Book.domain.in_(domains))
+    elif filters.get("domain"):
         stmt = stmt.where(Book.domain == filters["domain"])
     
     if filters.get("document_id"):
@@ -133,6 +154,16 @@ async def _allowed_chunk_ids(session: AsyncSession, filters: dict) -> set[str] |
     
     if filters.get("training_only"):
         stmt = stmt.where(Document.document_type.is_(None))
+
+    if filters.get("field_officer_knowledge_only"):
+        stmt = stmt.where(
+            or_(
+                Document.document_type.is_(None),
+                Document.document_type.in_(
+                    [DocumentType.MANUAL.value, DocumentType.SOP.value]
+                ),
+            )
+        )
     
     if filters.get("document_type"):
         document_type = filters["document_type"]
@@ -159,15 +190,24 @@ class HybridRetriever:
         self.bm25 = BM25Manager.instance(settings)
         self.reranker = NoOpReranker()
 
-    async def dense_search(self, query: str, filters: dict) -> list[RetrievalResult]:
-        allowed = await _allowed_chunk_ids(self.session, filters)
+    async def dense_search(
+        self,
+        query: str,
+        filters: dict,
+        allowed_ids: set[str] | None = None,
+    ) -> list[RetrievalResult]:
+        allowed = (
+            allowed_ids
+            if allowed_ids is not None
+            else await _allowed_chunk_ids(self.session, filters)
+        )
         try:
             raw = await self.vector_store.search(
                 query, self.settings.rag_dense_top_k * 5, allowed_ids=allowed
             )
         except Exception:
-            logger.exception("Dense retrieval failed for query=%r", query)
-            return []
+            logger.exception("Dense retrieval failed")
+            raise
         raw = [item for item in raw if float(item.get("score", 0.0)) >= self.settings.rag_similarity_threshold]
         return [RetrievalResult(
             chunk_id=str(x.get("chunk_id") or x.get("id")),
@@ -192,8 +232,17 @@ class HybridRetriever:
             dense_score=float(x.get("score", 0)),
         ) for x in raw[:self.settings.rag_dense_top_k]]
 
-    async def bm25_search(self, query: str, filters: dict) -> list[RetrievalResult]:
-        allowed = await _allowed_chunk_ids(self.session, filters)
+    async def bm25_search(
+        self,
+        query: str,
+        filters: dict,
+        allowed_ids: set[str] | None = None,
+    ) -> list[RetrievalResult]:
+        allowed = (
+            allowed_ids
+            if allowed_ids is not None
+            else await _allowed_chunk_ids(self.session, filters)
+        )
         raw = await self.bm25.search(self.session, query, self.settings.rag_bm25_top_k, allowed)
         return [RetrievalResult(
             chunk_id=str(x["chunk_id"]), document_id=str(x["document_id"]),
@@ -211,10 +260,24 @@ class HybridRetriever:
         ) for x, score in raw]
 
     async def search(self, query: str, filters: dict) -> list[RetrievalResult]:
-        logger.info("Content retrieval query=%r filters=%s", query, filters)
+        allowed = await _allowed_chunk_ids(self.session, filters)
+        logger.info(
+            "RAG eligible chunks role=%s domain=%s domains=%s "
+            "authorized_subject_count=%s filter_keys=%s count=%d",
+            filters.get("requester_role", "UNKNOWN"),
+            filters.get("domain"),
+            filters.get("domains"),
+            (
+                len(filters["_authorized_subject_ids"])
+                if filters.get("_authorized_subject_ids") is not None
+                else None
+            ),
+            sorted(key for key in filters if not key.startswith("_")),
+            len(allowed),
+        )
         # AsyncSession does not permit concurrent statements on one session.
-        dense = await self.dense_search(query, filters)
-        lexical = await self.bm25_search(query, filters)
+        dense = await self.dense_search(query, filters, allowed)
+        lexical = await self.bm25_search(query, filters, allowed)
         merged: dict[str, RetrievalResult] = {}
         ranks: dict[str, list[int]] = defaultdict(list)
         for rank, item in enumerate(dense, 1):
@@ -282,11 +345,23 @@ class HybridRetriever:
             ranked = await self.reranker.rerank(query, ranked, self.settings.rag_fused_top_k)
         selected = ranked[:self.settings.rag_fused_top_k]
         logger.info(
-            "Content retrieval candidates: dense=%d lexical=%d selected=%d chunks=%s scores=%s",
+            "RAG retrieval role=%s dense=%d bm25=%d selected=%d chunk_ids=%s scores=%s",
+            filters.get("requester_role", "UNKNOWN"),
             len(dense),
             len(lexical),
             len(selected),
             [item.chunk_id for item in selected],
             [round(item.relevance_score, 4) for item in selected],
         )
+        if not selected:
+            reason = (
+                "no authorized, current, ready chunks"
+                if not allowed
+                else "dense and BM25 returned no matching chunks"
+            )
+            logger.info(
+                "RAG returned no chunks role=%s reason=%s",
+                filters.get("requester_role", "UNKNOWN"),
+                reason,
+            )
         return selected

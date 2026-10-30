@@ -7,8 +7,13 @@ Create Date: 2026-10-08 18:48:37.243933
 
 from typing import Sequence, Union
 
-from alembic import op
 import sqlalchemy as sa
+
+from app.db.migration_compat import (
+    create_index_if_compatible,
+    create_table_if_compatible,
+    refuse_unsafe_downgrade,
+)
 
 
 revision: str = "8d90438ac069"
@@ -20,7 +25,7 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     """Upgrade database schema."""
 
-    op.create_table(
+    create_table_if_compatible(
         "evidence",
         sa.Column("id", sa.UUID(), nullable=False),
         sa.Column("report_type", sa.String(length=30), nullable=False),
@@ -47,21 +52,21 @@ def upgrade() -> None:
         sa.UniqueConstraint("storage_key"),
     )
 
-    op.create_index(
+    create_index_if_compatible(
         "ix_evidence_officer_id",
         "evidence",
         ["officer_id"],
         unique=False,
     )
 
-    op.create_index(
+    create_index_if_compatible(
         "ix_evidence_report_id",
         "evidence",
         ["report_id"],
         unique=False,
     )
 
-    op.create_index(
+    create_index_if_compatible(
         "ix_evidence_report_type",
         "evidence",
         ["report_type"],
@@ -70,21 +75,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Downgrade database schema."""
-
-    op.drop_index(
-        "ix_evidence_report_type",
-        table_name="evidence",
-    )
-
-    op.drop_index(
-        "ix_evidence_report_id",
-        table_name="evidence",
-    )
-
-    op.drop_index(
-        "ix_evidence_officer_id",
-        table_name="evidence",
-    )
-
-    op.drop_table("evidence")
+    refuse_unsafe_downgrade(revision)

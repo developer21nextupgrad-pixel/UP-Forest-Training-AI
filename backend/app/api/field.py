@@ -1884,7 +1884,16 @@ async def update_incident_report_draft(
 
 
     if not report:
+        if payload.client_operation_id:
+            result = await session.execute(
+                select(IncidentReport).where(
+                    IncidentReport.officer_id == user.id,
+                    IncidentReport.client_operation_id == payload.client_operation_id,
+                )
+            )
+            report = result.scalar_one_or_none()
 
+    if not report:
         raise HTTPException(
 
             status_code=404,
@@ -3410,11 +3419,11 @@ async def field_chat(
 
     session: AsyncSession = Depends(get_db_session),
 
-    _: User = Depends(require_field_officer),
+    user: User = Depends(require_field_officer),
 
 ) -> _RagChatResponse_:
 
-    """Answer a Field Officer question using FIELD-domain documents only."""
+    """Answer with shared non-legal training content and field documents."""
 
 
 
@@ -3432,8 +3441,9 @@ async def field_chat(
 
             {
 
-                "domain": "FIELD",
-
+                "requester_role": user.role.value,
+                "domains": ["FIELD", "TRAINING"],
+                "field_officer_knowledge_only": True,
                 "query_language": language_code,
 
             },
@@ -3759,17 +3769,20 @@ async def field_chat(
 
 
     if (
-
         not generation.grounded
-
         or not source_ids
-
         or not generation.answer.strip()
-
     ):
+        logger.info(
+            "Field Officer answer rejected: grounded=%s valid_citations=%d "
+            "available_sources=%d answer_present=%s",
+            generation.grounded,
+            len(source_ids),
+            len(valid_ids),
+            bool(generation.answer.strip()),
+        )
 
         return RagChatResponse(
-
             answer=_insufficient_context_message(language_code),
 
             found=False,

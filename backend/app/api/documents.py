@@ -64,6 +64,7 @@ async def admin_content_search(
         results, answer, grounded, sources = await ContentIntelligenceService(
             session, get_settings()
         ).answer(query, {
+            "requester_role": "ADMIN",
             "book_id": str(book_id) if book_id else None,
             "document_id": str(document_id) if document_id else None,
             "subject_id": str(subject_id) if subject_id else None,
