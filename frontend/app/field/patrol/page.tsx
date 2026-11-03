@@ -73,6 +73,7 @@ type PatrolReportDraft = {
   purpose: string | null;
   observations: string | null;
   wildlife_sighting: string | null;
+  wildlife_sightings: import("@/lib/patrol-wildlife").WildlifeSighting[];
   illegal_activity: string | null;
   action_taken: string | null;
   incident_details: string | null;

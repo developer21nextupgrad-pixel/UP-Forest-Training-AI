@@ -1271,6 +1271,35 @@ async def identify_species(
 
 
 
+async def _validate_patrol_wildlife_evidence(
+    payload: PatrolReportSaveRequest,
+    report_id: UUID,
+    user: User,
+    session: AsyncSession,
+) -> None:
+    evidence_ids = {
+        photo.evidence_id
+        for sighting in payload.wildlife_sightings
+        for photo in sighting.photos
+        if photo.evidence_id is not None
+    }
+    if not evidence_ids:
+        return
+    result = await session.execute(
+        select(Evidence.id).where(
+            Evidence.id.in_(evidence_ids),
+            Evidence.report_type == "PATROL",
+            Evidence.report_id == report_id,
+            Evidence.officer_id == user.id,
+        )
+    )
+    if set(result.scalars().all()) != evidence_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="A wildlife photo is not associated with this Patrol Report.",
+        )
+
+
 @router.post(
 
     "/forms/patrol",
@@ -1299,10 +1328,14 @@ async def save_patrol_report_draft(
         for field_name in (
             "patrol_date", "beat", "range_name", "division", "start_time", "end_time",
             "location", "team_members", "purpose", "observations", "wildlife_sighting",
+            "wildlife_sightings",
             "illegal_activity", "action_taken", "incident_details", "additional_remarks",
             "source_text", "ai_confidence",
         ):
-            setattr(report, field_name, getattr(payload, field_name))
+            value = getattr(payload, field_name)
+            if field_name == "wildlife_sightings":
+                value = [sighting.model_dump(mode="json") for sighting in value]
+            setattr(report, field_name, value)
 
     if payload.client_operation_id:
         existing = await session.execute(
@@ -1314,6 +1347,7 @@ async def save_patrol_report_draft(
         report = existing.scalar_one_or_none()
         if report is not None:
             if report.status == "DRAFT":
+                await _validate_patrol_wildlife_evidence(payload, report.id, user, session)
                 apply_payload(report)
                 await session.commit()
             return PatrolReportSaveResponse(
@@ -2773,9 +2807,8 @@ async def list_patrol_report_drafts(
             purpose=report.purpose,
 
             observations=report.observations,
-
             wildlife_sighting=report.wildlife_sighting,
-
+            wildlife_sightings=report.wildlife_sightings or [],
             illegal_activity=report.illegal_activity,
 
             action_taken=report.action_taken,
@@ -2888,7 +2921,7 @@ async def update_patrol_report_draft(
 
         )
 
-
+    await _validate_patrol_wildlife_evidence(payload, report.id, user, session)
 
     report.patrol_date = payload.patrol_date
 
@@ -2915,9 +2948,10 @@ async def update_patrol_report_draft(
     report.purpose = payload.purpose
 
     report.observations = payload.observations
-
     report.wildlife_sighting = payload.wildlife_sighting
-
+    report.wildlife_sightings = [
+        sighting.model_dump(mode="json") for sighting in payload.wildlife_sightings
+    ]
     report.illegal_activity = payload.illegal_activity
 
     report.action_taken = payload.action_taken
@@ -2998,6 +3032,8 @@ async def upload_evidence(
     file: UploadFile = File(...),
     description: str | None = Form(None),
     client_operation_id: str | None = Form(None, max_length=100),
+    wildlife_sighting_id: str | None = Form(None, max_length=100),
+    wildlife_photo_id: str | None = Form(None, max_length=100),
     user: User = Depends(require_field_officer),
     session: AsyncSession = Depends(get_db_session),
 ):
@@ -3085,6 +3121,20 @@ async def upload_evidence(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail="File size must not exceed 10 MB.",
         )
+    if isinstance(wildlife_sighting_id, str) or isinstance(wildlife_photo_id, str):
+        try:
+            image_width, image_height, image_format = SpeciesIdentificationService._validate_image(file_content)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Wildlife photo is not a valid JPEG, PNG, or WebP image.",
+            ) from exc
+        expected_format = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "webp": "webp"}.get(extension.lstrip("."))
+        if image_format != expected_format or image_width < 100 or image_height < 100 or image_width > 10000 or image_height > 10000:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Wildlife photos must be a valid JPEG, PNG, or WebP image between 100 and 10000 pixels per side.",
+            )
 
     # ---------------------------------------------------------
     # Verify that the report exists and belongs to this officer.
@@ -3125,6 +3175,118 @@ async def upload_evidence(
             detail="Report not found or you do not have access to it.",
         )
 
+    patrol_sightings: list[dict] | None = None
+    expected_wildlife_operation_id: str | None = None
+    has_wildlife_association = (
+        isinstance(wildlife_sighting_id, str) or isinstance(wildlife_photo_id, str)
+    )
+    if has_wildlife_association:
+        if report_type != "PATROL" or not wildlife_sighting_id or not wildlife_photo_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="A Patrol Report sighting and photo ID are both required.",
+            )
+        patrol_sightings = [
+            dict(sighting)
+            for sighting in (report.wildlife_sightings or [])
+            if isinstance(sighting, dict)
+        ]
+        sighting = next(
+            (item for item in patrol_sightings if item.get("sighting_id") == wildlife_sighting_id),
+            None,
+        )
+        if sighting is None or not isinstance(sighting.get("photos"), list):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The wildlife sighting is not part of this Patrol Report.",
+            )
+        photo = next(
+            (item for item in sighting["photos"]
+             if isinstance(item, dict) and item.get("photo_id") == wildlife_photo_id),
+            None,
+        )
+        if photo is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The wildlife photo is not part of this sighting.",
+            )
+        expected_wildlife_operation_id = (
+            f"wildlife:{wildlife_sighting_id}:{wildlife_photo_id}"
+        )
+    def evidence_response(item: Evidence) -> dict:
+        return {
+            "success": True,
+            "message": "Evidence uploaded successfully.",
+            "evidence": {
+                "id": str(item.id),
+                "report_type": item.report_type,
+                "report_id": str(item.report_id),
+                "file_name": item.file_name,
+                "file_type": item.file_type,
+                "file_size": item.file_size,
+                "mime_type": item.mime_type,
+                "description": item.description,
+                "uploaded_at": item.uploaded_at.isoformat() if item.uploaded_at else None,
+            },
+        }
+
+    async def resolve_existing_evidence(item: Evidence, target_report) -> dict:
+        if item.report_type != report_type or item.report_id != report_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Evidence operation ID was already used for a different report.",
+            )
+        if patrol_sightings is not None:
+            if client_operation_id != expected_wildlife_operation_id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "Evidence operation ID was already used for a different "
+                        "wildlife photo."
+                    ),
+                )
+            target_sightings = [
+                dict(sighting)
+                for sighting in (target_report.wildlife_sightings or [])
+                if isinstance(sighting, dict)
+            ]
+            target_sighting = next(
+                (sighting for sighting in target_sightings
+                 if sighting.get("sighting_id") == wildlife_sighting_id),
+                None,
+            )
+            target_photos = (target_sighting or {}).get("photos")
+            target_photo = next(
+                (
+                    candidate for candidate in target_photos or []
+                    if isinstance(candidate, dict)
+                    and candidate.get("photo_id") == wildlife_photo_id
+                ),
+                None,
+            ) if isinstance(target_photos, list) else None
+            if target_photo is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Wildlife photo does not belong to this report.",
+                )
+            linked_evidence_id = target_photo.get("evidence_id")
+            if linked_evidence_id and linked_evidence_id != str(item.id):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Wildlife photo is already linked to different evidence.",
+                )
+            if not linked_evidence_id:
+                target_sighting["photos"] = [
+                    {**candidate, "evidence_id": str(item.id)}
+                    if isinstance(candidate, dict)
+                    and candidate.get("photo_id") == wildlife_photo_id
+                    else candidate
+                    for candidate in target_photos
+                ]
+                target_report.wildlife_sightings = target_sightings
+                await session.commit()
+        return evidence_response(item)
+
     if client_operation_id:
         existing_result = await session.execute(
             select(Evidence).where(
@@ -3134,26 +3296,18 @@ async def upload_evidence(
         )
         existing = existing_result.scalar_one_or_none()
         if existing is not None:
-            if existing.report_type != report_type or existing.report_id != report_id:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Evidence operation ID was already used for a different report.",
-                )
-            return {
-                "success": True,
-                "message": "Evidence uploaded successfully.",
-                "evidence": {
-                    "id": str(existing.id),
-                    "report_type": existing.report_type,
-                    "report_id": str(existing.report_id),
-                    "file_name": existing.file_name,
-                    "file_type": existing.file_type,
-                    "file_size": existing.file_size,
-                    "mime_type": existing.mime_type,
-                    "description": existing.description,
-                    "uploaded_at": existing.uploaded_at.isoformat() if existing.uploaded_at else None,
-                },
-            }
+            return await resolve_existing_evidence(existing, report)
+    if (
+        patrol_sightings is not None
+        and client_operation_id != expected_wildlife_operation_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Wildlife photo uploads require the stable operation ID for the "
+                "target photo."
+            ),
+        )
 
     # ---------------------------------------------------------
     # Store the file using a random filename.
@@ -3181,8 +3335,22 @@ async def upload_evidence(
             mime_type=expected_mime_type,
             description=description.strip() if description else None,
         )
-
         session.add(evidence)
+        await session.flush()
+
+        if patrol_sightings is not None:
+            for sighting in patrol_sightings:
+                if sighting.get("sighting_id") == wildlife_sighting_id:
+                    sighting["photos"] = [
+                        {
+                            **photo,
+                            "evidence_id": str(evidence.id),
+                        } if isinstance(photo, dict) and photo.get("photo_id") == wildlife_photo_id
+                        else photo
+                        for photo in sighting["photos"]
+                    ]
+            report.wildlife_sightings = patrol_sightings
+
         await session.commit()
         await session.refresh(evidence)
 
@@ -3195,24 +3363,25 @@ async def upload_evidence(
             )
         ) if client_operation_id else None
         existing = existing_result.scalar_one_or_none() if existing_result is not None else None
-        if existing is not None and existing.report_type == report_type and existing.report_id == report_id:
+        if existing is not None:
             if storage_path.exists():
                 storage_path.unlink()
-            return {
-                "success": True,
-                "message": "Evidence uploaded successfully.",
-                "evidence": {
-                    "id": str(existing.id),
-                    "report_type": existing.report_type,
-                    "report_id": str(existing.report_id),
-                    "file_name": existing.file_name,
-                    "file_type": existing.file_type,
-                    "file_size": existing.file_size,
-                    "mime_type": existing.mime_type,
-                    "description": existing.description,
-                    "uploaded_at": existing.uploaded_at.isoformat() if existing.uploaded_at else None,
-                },
-            }
+            if report_type == "PATROL":
+                refreshed_report_result = await session.execute(
+                    select(FieldPatrolReport).where(
+                        FieldPatrolReport.id == report_id,
+                        FieldPatrolReport.officer_id == user.id,
+                    )
+                )
+                refreshed_report = refreshed_report_result.scalar_one_or_none()
+                if refreshed_report is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Report not found or you do not have access to it.",
+                    )
+            else:
+                refreshed_report = report
+            return await resolve_existing_evidence(existing, refreshed_report)
         if storage_path.exists():
             storage_path.unlink()
         logger.exception("Failed idempotent evidence upload for report %s", report_id)
@@ -3257,6 +3426,142 @@ async def upload_evidence(
             ),
         },
     }
+
+
+@router.post("/forms/patrol/{report_id}/wildlife-identify")
+async def identify_patrol_wildlife_photo(
+    report_id: UUID,
+    evidence_id: UUID = Form(...),
+    wildlife_sighting_id: str = Form(..., max_length=100),
+    wildlife_photo_id: str = Form(..., max_length=100),
+    user: User = Depends(require_field_officer),
+    session: AsyncSession = Depends(get_db_session),
+):
+    report_result = await session.execute(
+        select(FieldPatrolReport).where(
+            FieldPatrolReport.id == report_id,
+            FieldPatrolReport.officer_id == user.id,
+        )
+    )
+    report = report_result.scalar_one_or_none()
+    if report is None:
+        raise HTTPException(status_code=404, detail="Patrol report not found or you do not have access to it.")
+
+    evidence_result = await session.execute(
+        select(Evidence).where(
+            Evidence.id == evidence_id,
+            Evidence.report_type == "PATROL",
+            Evidence.report_id == report_id,
+            Evidence.officer_id == user.id,
+        )
+    )
+    evidence = evidence_result.scalar_one_or_none()
+    if evidence is None:
+        raise HTTPException(status_code=404, detail="Wildlife photo evidence not found or you do not have access to it.")
+
+    sightings = [
+        dict(sighting)
+        for sighting in (report.wildlife_sightings or [])
+        if isinstance(sighting, dict)
+    ]
+    target_photo = None
+    for sighting in sightings:
+        if sighting.get("sighting_id") != wildlife_sighting_id:
+            continue
+        for photo in sighting.get("photos", []):
+            if isinstance(photo, dict) and photo.get("photo_id") == wildlife_photo_id:
+                target_photo = photo
+                break
+    if target_photo is None or target_photo.get("evidence_id") != str(evidence.id):
+        raise HTTPException(status_code=400, detail="The wildlife photo is not associated with this Patrol Report sighting.")
+
+    storage_path = Path(evidence.storage_key)
+    if not storage_path.is_file():
+        raise HTTPException(status_code=404, detail="Wildlife photo file is not available.")
+
+    try:
+        identification = await SpeciesIdentificationService().identify(
+            image_bytes=storage_path.read_bytes(),
+            filename=evidence.file_name,
+        )
+    except Exception as exc:
+        logger.exception("Wildlife photo identification failed for evidence %s", evidence.id)
+        raise HTTPException(
+            status_code=503,
+            detail="The photo is saved, but wildlife identification is temporarily unavailable. Retry synchronization to try again.",
+        ) from exc
+
+    confidence = identification.get("confidence")
+    try:
+        confidence_value = float(confidence) if confidence is not None else None
+    except (TypeError, ValueError):
+        confidence_value = None
+    if confidence_value is not None and not 0.0 <= confidence_value <= 1.0:
+        raise HTTPException(
+            status_code=503,
+            detail="Wildlife identification returned an invalid confidence score. Retry identification.",
+        )
+    raw_status = str(
+        identification.get("identification_status") or identification.get("status", "")
+    ).lower()
+    if "not_ident" in raw_status or "not identifiable" in raw_status:
+        result_status = "NOT_IDENTIFIABLE"
+    elif confidence_value is None or confidence_value < 0.65 or "uncertain" in raw_status:
+        result_status = "UNCERTAIN"
+    else:
+        result_status = "IDENTIFIED"
+    raw_candidates = (
+        identification.get("alternative_species")
+        or identification.get("candidates")
+        or []
+    )
+    candidates = []
+    if isinstance(raw_candidates, list):
+        for candidate in raw_candidates[:10]:
+            if not isinstance(candidate, dict):
+                continue
+            candidate_confidence = candidate.get("confidence")
+            try:
+                candidate_confidence = (
+                    float(candidate_confidence)
+                    if candidate_confidence is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                candidate_confidence = None
+            if candidate_confidence is not None and not 0.0 <= candidate_confidence <= 1.0:
+                candidate_confidence = None
+            candidates.append({
+                "common_name": candidate.get("common_name"),
+                "scientific_name": candidate.get("scientific_name"),
+                "confidence": candidate_confidence,
+            })
+
+    stored_identification = {
+        "status": result_status,
+        "common_name": identification.get("common_name") or identification.get("local_name"),
+        "scientific_name": identification.get("scientific_name"),
+        "confidence": confidence_value,
+        "candidates": candidates,
+    }
+
+    for sighting in sightings:
+        if sighting.get("sighting_id") == wildlife_sighting_id:
+            sighting["photos"] = [
+                {**photo, "identification": stored_identification}
+                if isinstance(photo, dict) and photo.get("photo_id") == wildlife_photo_id
+                else photo
+                for photo in sighting.get("photos", [])
+            ]
+    report.wildlife_sightings = sightings
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        logger.exception("Failed to save wildlife identification for evidence %s", evidence.id)
+        raise HTTPException(status_code=500, detail="Unable to save wildlife identification.")
+
+    return {"success": True, "identification": stored_identification}
 
 @router.get("/evidence/{evidence_id}/file")
 async def get_evidence_file(
@@ -3321,6 +3626,27 @@ async def delete_evidence(
     storage_path = Path(evidence.storage_key)
 
     try:
+        if evidence.report_type == "PATROL":
+            report_result = await session.execute(
+                select(FieldPatrolReport).where(
+                    FieldPatrolReport.id == evidence.report_id,
+                    FieldPatrolReport.officer_id == user.id,
+                )
+            )
+            report = report_result.scalar_one_or_none()
+            if report is not None:
+                report.wildlife_sightings = [
+                    {
+                        **sighting,
+                        "photos": [
+                            photo
+                            for photo in sighting.get("photos", [])
+                            if not isinstance(photo, dict) or photo.get("evidence_id") != str(evidence.id)
+                        ],
+                    }
+                    for sighting in (report.wildlife_sightings or [])
+                    if isinstance(sighting, dict)
+                ]
         await session.delete(evidence)
         await session.commit()
     except Exception:

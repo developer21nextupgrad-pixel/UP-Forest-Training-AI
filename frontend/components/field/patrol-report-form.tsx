@@ -1,30 +1,51 @@
 "use client";
 
+import Image from "next/image";
 import {
     AlertTriangle,
+    Camera,
     CheckCircle2,
+    ImagePlus,
     Loader2,
+    MapPin,
     Plus,
+    RefreshCw,
     RotateCcw,
     Save,
     Send,
     Trash2,
+    X,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import { apiRequest } from "@/lib/api";
+import { apiRequest, apiUrl } from "@/lib/api";
+import { getAccessToken } from "@/lib/auth";
 import {
     createFieldLocalId,
+    cancelOfflineEvidenceUpload,
+    enqueueOfflineEvidenceDelete,
+    enqueueOfflineEvidenceUpload,
+    enqueueOfflineWildlifeIdentification,
     enqueueOfflineFieldOperation,
     fieldCreateOperationId,
     fieldSyncableFailure,
     getOfflineFormRecord,
     loadOfflineFormDraft,
+    markOfflineFieldFormSubmitted,
+    persistPatrolMetadataBeforeWildlifeEvidence,
     saveOfflineFormDraft,
     useOfflineFieldForm,
     type OfflineFieldRecord,
 } from "@/lib/offline-field-forms";
+import {
+    captureWildlifeLocation,
+    compressWildlifeImage,
+    createWildlifeSighting,
+    type WildlifePhoto,
+    type WildlifeLocation,
+    type WildlifeSighting,
+} from "@/lib/patrol-wildlife";
 import { OfflineFieldFormControls } from "./offline-field-form-controls";
 
 type PatrolReportFields = {
@@ -42,6 +63,7 @@ type PatrolReportFields = {
     purpose: string | null;
     observations: string | null;
     wildlife_sighting: string | null;
+    wildlife_sightings: WildlifeSighting[];
     illegal_activity: string | null;
     action_taken: string | null;
     incident_details: string | null;
@@ -85,6 +107,69 @@ type PatrolReportDraft = PatrolReportFields & {
     updated_at: string | null;
 };
 
+function WildlifePhotoPreview({ photo }: { photo: WildlifePhoto }) {
+    const [src, setSrc] = useState<string | null>(null);
+
+    useEffect(() => {
+        let objectUrl: string | null = null;
+        let cancelled = false;
+        if (photo.file) {
+            objectUrl = URL.createObjectURL(photo.file);
+            setSrc(objectUrl);
+        } else if (photo.evidence_id) {
+            const token = getAccessToken();
+            void fetch(apiUrl(`/api/v1/field/evidence/${photo.evidence_id}/file`), {
+                headers: token ? { Authorization: `Bearer ${token}` } : {},
+            }).then(async (response) => {
+                if (!response.ok) throw new Error("Unable to load the saved wildlife photo.");
+                objectUrl = URL.createObjectURL(await response.blob());
+                if (!cancelled) setSrc(objectUrl);
+            }).catch((error: unknown) => {
+                if (!cancelled) toast.error(error instanceof Error ? error.message : "Unable to load the saved wildlife photo.");
+            });
+        }
+        return () => {
+            cancelled = true;
+            if (objectUrl) URL.revokeObjectURL(objectUrl);
+        };
+    }, [photo.evidence_id, photo.file]);
+
+    return src
+        ? <Image src={src} alt={photo.file_name} width={96} height={96} unoptimized className="h-24 w-24 rounded-lg object-cover" />
+        : <div className="flex h-24 w-24 items-center justify-center rounded-lg bg-muted text-xs text-muted-foreground">Preview unavailable</div>;
+}
+
+function serializableWildlifeSightings(sightings: WildlifeSighting[]) {
+    return sightings.map((sighting) => ({
+        ...sighting,
+        photos: sighting.photos.map((photo) => {
+            const metadata = { ...photo };
+            delete metadata.file;
+            delete metadata.upload_status;
+            delete metadata.upload_error;
+            return metadata;
+        }),
+    }));
+}
+
+function mergeWildlifeSightings(
+    current: WildlifeSighting[],
+    incoming: WildlifeSighting[],
+): WildlifeSighting[] {
+    const currentById = new Map(current.map((sighting) => [sighting.sighting_id, sighting]));
+    return incoming.map((sighting) => {
+        const existing = currentById.get(sighting.sighting_id);
+        const photos = new Map((existing?.photos ?? []).map((photo) => [photo.photo_id, photo]));
+        return {
+            ...sighting,
+            photos: sighting.photos.map((photo) => ({
+                ...photo,
+                file: photo.file ?? photos.get(photo.photo_id)?.file,
+            })),
+        };
+    });
+}
+
 type Props = {
     onClose?: () => void;
     initialDraft?: PatrolReportDraft | null;
@@ -106,6 +191,7 @@ const EMPTY_FIELDS: PatrolReportFields = {
     purpose: null,
     observations: null,
     wildlife_sighting: null,
+    wildlife_sightings: [],
     illegal_activity: null,
     action_taken: null,
     incident_details: null,
@@ -151,6 +237,10 @@ export function PatrolReportForm({
     const [fields, setFields] =
         useState<PatrolReportFields>(EMPTY_FIELDS);
 
+    const [photoTarget, setPhotoTarget] = useState<{ sightingId: string; photoId?: string } | null>(null);
+    const cameraInputRef = useRef<HTMLInputElement>(null);
+    const galleryInputRef = useRef<HTMLInputElement>(null);
+
     const [missingFields, setMissingFields] = useState<string[]>([]);
 
     const [confidence, setConfidence] =
@@ -194,23 +284,45 @@ export function PatrolReportForm({
         }
         setOfflineDraftRestored(false);
         if (!offline.ownerId) return;
-        if (initialDraft) {
-            setOfflineDraftRestored(true);
-            return;
-        }
         let cancelled = false;
         void loadOfflineFormDraft<Record<string, unknown>>(offline.ownerId, "PATROL_REPORT", "active")
-            .then((draft) => {
+            .then(async (draft) => {
                 if (cancelled || !draft) return;
                 const snapshot = draft.snapshot;
+                let matchingRecord: OfflineFieldRecord | undefined;
+                if (typeof snapshot.localId === "string") {
+                    matchingRecord = await getOfflineFormRecord(
+                        offline.ownerId!,
+                        "PATROL_REPORT",
+                        snapshot.localId,
+                    );
+                }
+                if (initialDraft &&
+                    matchingRecord?.serverId !== initialDraft.report_id &&
+                    snapshot.reportId !== initialDraft.report_id &&
+                    snapshot.savedReportId !== initialDraft.report_id) {
+                    return;
+                }
                 if (typeof snapshot.localId === "string") localId.current = snapshot.localId;
-                if (snapshot.fields && typeof snapshot.fields === "object") setFields(snapshot.fields as PatrolReportFields);
+                if (snapshot.fields && typeof snapshot.fields === "object") {
+                    const storedFields = snapshot.fields as Partial<PatrolReportFields>;
+                    setFields((previous) => ({
+                        ...previous,
+                        ...storedFields,
+                        wildlife_sightings: mergeWildlifeSightings(
+                            previous.wildlife_sightings,
+                            Array.isArray(storedFields.wildlife_sightings)
+                                ? storedFields.wildlife_sightings
+                                : [],
+                        ),
+                    }));
+                }
                 if (typeof snapshot.description === "string") setDescription(snapshot.description);
                 if (typeof snapshot.confidence === "number" || snapshot.confidence === null) setConfidence(snapshot.confidence as number | null);
                 setIsExtracted(snapshot.isExtracted === true);
-                if (typeof snapshot.reportId === "string") setReportId(snapshot.reportId);
-                if (typeof snapshot.savedReportId === "string") setSavedReportId(snapshot.savedReportId);
-                if (snapshot.queuedCreate === true) setQueuedCreate(true);
+                if (!initialDraft && typeof snapshot.reportId === "string") setReportId(snapshot.reportId);
+                if (!initialDraft && typeof snapshot.savedReportId === "string") setSavedReportId(snapshot.savedReportId);
+                if (!initialDraft && snapshot.queuedCreate === true) setQueuedCreate(true);
                 toast.info("Restored your locally saved patrol report draft.");
             })
             .catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Unable to restore the local patrol draft."))
@@ -242,6 +354,15 @@ export function PatrolReportForm({
                         setReportId(record.serverId);
                         setSavedReportId(record.serverId);
                         setQueuedCreate(false);
+                    }
+                    if (Array.isArray(record.payload.wildlife_sightings)) {
+                        setFields((previous) => ({
+                            ...previous,
+                            wildlife_sightings: mergeWildlifeSightings(
+                                previous.wildlife_sightings,
+                                record.payload.wildlife_sightings as WildlifeSighting[],
+                            ),
+                        }));
                     }
                     if (record.status === "SUBMITTED") setIsSubmitted(true);
                 })
@@ -276,6 +397,7 @@ export function PatrolReportForm({
             purpose: initialDraft.purpose,
             observations: initialDraft.observations,
             wildlife_sighting: initialDraft.wildlife_sighting,
+            wildlife_sightings: initialDraft.wildlife_sightings ?? [],
             illegal_activity: initialDraft.illegal_activity,
             action_taken: initialDraft.action_taken,
             incident_details: initialDraft.incident_details,
@@ -293,9 +415,9 @@ export function PatrolReportForm({
         setIsSubmitted(initialDraft.status === "SUBMITTED");
     }, [initialDraft]);
 
-    const updateField = (
-        key: keyof PatrolReportFields,
-        value: string | null,
+    const updateField = <K extends keyof PatrolReportFields>(
+        key: K,
+        value: PatrolReportFields[K],
     ) => {
         setFields((previous) => ({
             ...previous,
@@ -336,6 +458,275 @@ export function PatrolReportForm({
             setMissingFields((previous) =>
                 previous.filter((field) => field !== "purpose"),
             );
+        }
+    };
+
+    const addWildlifeSighting = async () => {
+        let location: WildlifeLocation | undefined;
+        try {
+            location = await captureWildlifeLocation();
+        } catch (error) {
+            toast.info(error instanceof Error ? error.message : "Location is unavailable. You can enter coordinates manually.");
+        }
+        setFields((previous) => ({
+            ...previous,
+            wildlife_sightings: [...previous.wildlife_sightings, createWildlifeSighting(location)],
+        }));
+    };
+
+    const getStoredEvidenceId = async (
+        sightingId: string,
+        photoId: string,
+        fallback: string | null,
+    ) => {
+        if (!offline.ownerId) return fallback;
+        const record = await getOfflineFormRecord(offline.ownerId, "PATROL_REPORT", localId.current);
+        const sightings = record?.payload.wildlife_sightings;
+        if (!Array.isArray(sightings)) return fallback;
+        const sighting = sightings.find((item) =>
+            item && typeof item === "object" && (item as Record<string, unknown>).sighting_id === sightingId,
+        ) as Record<string, unknown> | undefined;
+        const photos = sighting?.photos;
+        if (!Array.isArray(photos)) return fallback;
+        const photo = photos.find((item) =>
+            item && typeof item === "object" && (item as Record<string, unknown>).photo_id === photoId,
+        ) as Record<string, unknown> | undefined;
+        return typeof photo?.evidence_id === "string" ? photo.evidence_id : fallback;
+    };
+
+    const removeWildlifePhoto = async (sightingId: string, photoId: string) => {
+        const sighting = fields.wildlife_sightings.find((item) => item.sighting_id === sightingId);
+        const photo = sighting?.photos.find((item) => item.photo_id === photoId);
+        if (!sighting || !photo) return;
+        const nextSightings = fields.wildlife_sightings.map((item) =>
+            item.sighting_id === sightingId
+                ? { ...item, photos: item.photos.filter((itemPhoto) => itemPhoto.photo_id !== photoId) }
+                : item,
+        );
+        try {
+            if (offline.ownerId) {
+                const evidenceId = await getStoredEvidenceId(sightingId, photoId, photo.evidence_id);
+                const record: OfflineFieldRecord = {
+                    ownerId: offline.ownerId,
+                    module: "PATROL_REPORT",
+                    localId: localId.current,
+                    serverId: reportId,
+                    payload: {
+                        ...fields,
+                        wildlife_sightings: serializableWildlifeSightings(nextSightings),
+                    },
+                    status: "DRAFT",
+                    syncError: null,
+                    updatedAt: new Date().toISOString(),
+                };
+                if (evidenceId) {
+                    await enqueueOfflineEvidenceDelete(offline.ownerId, record, evidenceId);
+                } else if (photo.file) {
+                    await cancelOfflineEvidenceUpload(
+                        offline.ownerId,
+                        "PATROL_REPORT",
+                        localId.current,
+                        `wildlife:${sightingId}:${photoId}`,
+                    );
+                    await enqueueOfflineFieldOperation(
+                        offline.ownerId,
+                        "PATROL_REPORT",
+                        record,
+                        reportId ? "UPDATE" : "CREATE",
+                    );
+                }
+            }
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : "Unable to remove the wildlife photo.");
+            return;
+        }
+        setFields((previous) => ({
+            ...previous,
+            wildlife_sightings: nextSightings,
+        }));
+    };
+
+    const removeWildlifeSighting = async (sightingId: string) => {
+        const sighting = fields.wildlife_sightings.find((item) => item.sighting_id === sightingId);
+        if (!sighting) return;
+        const nextSightings = fields.wildlife_sightings.filter(
+            (item) => item.sighting_id !== sightingId,
+        );
+        try {
+            if (offline.ownerId) {
+                const record: OfflineFieldRecord = {
+                    ownerId: offline.ownerId,
+                    module: "PATROL_REPORT",
+                    localId: localId.current,
+                    serverId: reportId,
+                    payload: {
+                        ...fields,
+                        wildlife_sightings: serializableWildlifeSightings(nextSightings),
+                    },
+                    status: "DRAFT",
+                    syncError: null,
+                    updatedAt: new Date().toISOString(),
+                };
+                for (const photo of sighting.photos) {
+                    const evidenceId = await getStoredEvidenceId(
+                        sightingId,
+                        photo.photo_id,
+                        photo.evidence_id,
+                    );
+                    if (evidenceId) {
+                        await enqueueOfflineEvidenceDelete(offline.ownerId, record, evidenceId);
+                    } else if (photo.file) {
+                        await cancelOfflineEvidenceUpload(
+                            offline.ownerId,
+                            "PATROL_REPORT",
+                            localId.current,
+                            `wildlife:${sightingId}:${photo.photo_id}`,
+                        );
+                        await enqueueOfflineFieldOperation(
+                            offline.ownerId,
+                            "PATROL_REPORT",
+                            record,
+                            reportId ? "UPDATE" : "CREATE",
+                        );
+                    }
+                }
+            }
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : "Unable to remove the wildlife sighting.");
+            return;
+        }
+        setFields((previous) => ({
+            ...previous,
+            wildlife_sightings: nextSightings,
+        }));
+    };
+
+    const captureSightingLocation = async (sightingId: string) => {
+        try {
+            const location = await captureWildlifeLocation();
+            setFields((previous) => ({
+                ...previous,
+                wildlife_sightings: previous.wildlife_sightings.map((sighting) =>
+                    sighting.sighting_id === sightingId
+                        ? { ...sighting, ...location }
+                        : sighting,
+                ),
+            }));
+            toast.success("Current location captured.");
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : "Unable to capture current location.");
+        }
+    };
+
+    const handleWildlifePhotoSelection = async (selectedFiles: FileList | null) => {
+        if (!selectedFiles || !photoTarget) return;
+        const target = photoTarget;
+        setPhotoTarget(null);
+        const prepared: WildlifePhoto[] = [];
+        for (const file of Array.from(selectedFiles)) {
+            try {
+                const compressed = await compressWildlifeImage(file);
+                prepared.push({
+                    photo_id: crypto.randomUUID(),
+                    file_name: compressed.name,
+                    mime_type: compressed.type,
+                    file_size: compressed.size,
+                    evidence_id: null,
+                    identification: {
+                        status: "PENDING",
+                        common_name: null,
+                        scientific_name: null,
+                        confidence: null,
+                    },
+                    file: compressed,
+                });
+            } catch (error) {
+                toast.error(error instanceof Error ? error.message : "Unable to process the selected wildlife photo.");
+            }
+        }
+        if (!prepared.length) return;
+        if (target.photoId) await removeWildlifePhoto(target.sightingId, target.photoId);
+        const nextSightings = fields.wildlife_sightings.map((sighting) => {
+            if (sighting.sighting_id !== target.sightingId) return sighting;
+            return { ...sighting, photos: [...sighting.photos, ...prepared] };
+        });
+        setFields((previous) => ({
+            ...previous,
+            wildlife_sightings: previous.wildlife_sightings.map((sighting) => {
+                if (sighting.sighting_id !== target.sightingId) return sighting;
+                return { ...sighting, photos: [...sighting.photos, ...prepared] };
+            }),
+        }));
+
+        // Start the normal offline queue as soon as the photo is selected.
+        // Pass the new snapshot explicitly because React state updates are async.
+        if (offline.ownerId) {
+            const record: OfflineFieldRecord = {
+                ownerId: offline.ownerId,
+                module: "PATROL_REPORT",
+                localId: localId.current || (localId.current = createFieldLocalId()),
+                serverId: reportId,
+                payload: {
+                    ...fields,
+                    wildlife_sightings: nextSightings,
+                },
+                status: "DRAFT",
+                syncError: null,
+                updatedAt: new Date().toISOString(),
+            };
+            void queueWildlifePhotos(record, false, nextSightings).catch((error: unknown) => {
+                toast.error(error instanceof Error
+                    ? error.message
+                    : "Unable to queue the wildlife photo for upload.");
+            });
+        }
+    };
+
+    const updateSighting = (sightingId: string, update: Partial<WildlifeSighting>) => {
+        setFields((previous) => ({
+            ...previous,
+            wildlife_sightings: previous.wildlife_sightings.map((sighting) =>
+                sighting.sighting_id === sightingId ? { ...sighting, ...update } : sighting,
+            ),
+        }));
+    };
+
+    const queueWildlifePhotos = async (
+        record: OfflineFieldRecord,
+        reportMetadataReady = false,
+        sightingsSnapshot: WildlifeSighting[] = fields.wildlife_sightings,
+    ) => {
+        if (!offline.ownerId) return;
+        if (!reportMetadataReady) {
+            await persistPatrolMetadataBeforeWildlifeEvidence(offline.ownerId, record);
+        }
+        for (const sighting of sightingsSnapshot) {
+            for (const photo of sighting.photos) {
+                if (photo.evidence_id) {
+                    if (["PENDING", "FAILED"].includes(photo.identification.status)) {
+                        await enqueueOfflineWildlifeIdentification(
+                            offline.ownerId,
+                            record,
+                            photo.evidence_id,
+                            sighting.sighting_id,
+                            photo.photo_id,
+                        );
+                    }
+                    continue;
+                }
+                if (!photo.file) continue;
+                const file = photo.file instanceof File
+                    ? photo.file
+                    : new File([photo.file], photo.file_name, { type: photo.mime_type });
+                await enqueueOfflineEvidenceUpload(
+                    offline.ownerId,
+                    record,
+                    file,
+                    `Wildlife sighting ${sighting.sighting_id}`,
+                    `wildlife:${sighting.sighting_id}:${photo.photo_id}`,
+                    { sightingId: sighting.sighting_id, photoId: photo.photo_id },
+                );
+            }
         }
     };
 
@@ -441,6 +832,23 @@ export function PatrolReportForm({
             return false;
         }
 
+        for (const [index, sighting] of fields.wildlife_sightings.entries()) {
+            const hasLatitude = sighting.latitude !== null;
+            const hasLongitude = sighting.longitude !== null;
+            if (hasLatitude !== hasLongitude) {
+                toast.error(`Enter both latitude and longitude for wildlife sighting ${index + 1}, or leave both blank.`);
+                return false;
+            }
+            if (
+                (hasLatitude && (!Number.isFinite(sighting.latitude) || sighting.latitude! < -90 || sighting.latitude! > 90)) ||
+                (hasLongitude && (!Number.isFinite(sighting.longitude) || sighting.longitude! < -180 || sighting.longitude! > 180)) ||
+                (sighting.accuracy_m !== null && (!Number.isFinite(sighting.accuracy_m) || sighting.accuracy_m < 0))
+            ) {
+                toast.error(`Check the GPS coordinates and accuracy for wildlife sighting ${index + 1}.`);
+                return false;
+            }
+        }
+
         return true;
     };
 
@@ -464,6 +872,7 @@ export function PatrolReportForm({
         try {
             const payload = {
                 ...fields,
+                wildlife_sightings: serializableWildlifeSightings(fields.wildlife_sightings),
 
                 team_members: fields.team_members
                     .map((member) => member.trim())
@@ -494,6 +903,7 @@ export function PatrolReportForm({
                     record,
                     reportId ? "UPDATE" : "CREATE",
                 );
+                await queueWildlifePhotos(record, true);
                 if (!reportId) setQueuedCreate(true);
                 toast.info("Patrol report draft is saved locally and will sync when the service is available.");
                 return;
@@ -525,6 +935,7 @@ export function PatrolReportForm({
                         updatedAt: new Date().toISOString(),
                     };
                     await enqueueOfflineFieldOperation(offline.ownerId, "PATROL_REPORT", record, isUpdating ? "UPDATE" : "CREATE");
+                    await queueWildlifePhotos(record, true);
                     setQueuedCreate(!isUpdating);
                     toast.info("Patrol report draft is saved locally and will sync when the service is available.");
                     return;
@@ -538,6 +949,16 @@ export function PatrolReportForm({
             setReportId(result.report_id);
             setSavedReportId(result.report_id);
             setQueuedCreate(false);
+            await queueWildlifePhotos({
+                ownerId: offline.ownerId ?? "",
+                module: "PATROL_REPORT",
+                localId: localId.current,
+                serverId: result.report_id,
+                payload,
+                status: "DRAFT",
+                syncError: null,
+                updatedAt: new Date().toISOString(),
+            }, true);
 
             toast.success(
                 isUpdating
@@ -585,77 +1006,95 @@ export function PatrolReportForm({
         setIsSubmitting(true);
 
         try {
+            const payload = {
+                ...fields,
+                wildlife_sightings: serializableWildlifeSightings(fields.wildlife_sightings),
+                team_members: fields.team_members.map((member) => member.trim()).filter(Boolean),
+                source_text: description.trim() || null,
+                ai_confidence: confidence,
+            };
+            const record: OfflineFieldRecord = {
+                ownerId: offline.ownerId ?? "",
+                module: "PATROL_REPORT",
+                localId: localId.current,
+                serverId: savedReportId,
+                payload,
+                status: "PENDING_SUBMISSION",
+                syncError: null,
+                updatedAt: new Date().toISOString(),
+            };
+
             if (offline.ownerId && (!navigator.onLine || (queuedCreate && !savedReportId))) {
-                const record: OfflineFieldRecord = {
-                    ownerId: offline.ownerId,
-                    module: "PATROL_REPORT",
-                    localId: localId.current,
-                    serverId: savedReportId,
-                    payload: {
-                        ...fields,
-                        team_members: fields.team_members.map((member) => member.trim()).filter(Boolean),
-                        source_text: description.trim() || null,
-                        ai_confidence: confidence,
-                    },
-                    status: "PENDING_SUBMISSION",
-                    syncError: null,
-                    updatedAt: new Date().toISOString(),
-                };
+                await enqueueOfflineFieldOperation(
+                    offline.ownerId,
+                    "PATROL_REPORT",
+                    record,
+                    savedReportId ? "UPDATE" : "CREATE",
+                );
+                await queueWildlifePhotos(record, true);
                 await enqueueOfflineFieldOperation(offline.ownerId, "PATROL_REPORT", record, "SUBMIT");
+                if (!savedReportId) setQueuedCreate(true);
                 toast.info("Submission is pending sync and server validation.");
                 return;
             }
-            const result =
-                await apiRequest<PatrolReportSubmitResponse>(
-                    `/api/v1/field/forms/patrol/${savedReportId}/submit`,
-                    {
-                        method: "POST",
-                    },
+
+            if (savedReportId) {
+                const saveResult = await apiRequest<PatrolReportSaveResponse>(
+                    `/api/v1/field/forms/patrol/${savedReportId}`,
+                    { method: "PUT", body: JSON.stringify(payload) },
                 );
+                if (!saveResult.success) {
+                    if (offline.ownerId && fieldSyncableFailure(saveResult)) {
+                        await enqueueOfflineFieldOperation(
+                            offline.ownerId,
+                            "PATROL_REPORT",
+                            record,
+                            "UPDATE",
+                        );
+                        await queueWildlifePhotos(record, true);
+                        await enqueueOfflineFieldOperation(offline.ownerId, "PATROL_REPORT", record, "SUBMIT");
+                        toast.info("Submission is pending sync and server validation.");
+                        return;
+                    }
+                    throw new Error(saveResult.message || "Unable to save the Patrol Report before submission.");
+                }
+                record.serverId = saveResult.report_id;
+                await queueWildlifePhotos(record, true);
+            }
+
+            const result = await apiRequest<PatrolReportSubmitResponse>(
+                `/api/v1/field/forms/patrol/${savedReportId}/submit`,
+                { method: "POST" },
+            );
 
             if (!result.success) {
                 if (offline.ownerId && fieldSyncableFailure(result)) {
-                    const record: OfflineFieldRecord = {
-                        ownerId: offline.ownerId,
-                        module: "PATROL_REPORT",
-                        localId: localId.current,
-                        serverId: savedReportId,
-                        payload: {
-                            ...fields,
-                            team_members: fields.team_members.map((member) => member.trim()).filter(Boolean),
-                            source_text: description.trim() || null,
-                            ai_confidence: confidence,
-                        },
-                        status: "PENDING_SUBMISSION",
-                        syncError: null,
-                        updatedAt: new Date().toISOString(),
-                    };
-                    await enqueueOfflineFieldOperation(offline.ownerId, "PATROL_REPORT", record, "SUBMIT");
+                    await enqueueOfflineFieldOperation(
+                        offline.ownerId,
+                        "PATROL_REPORT",
+                        { ...record, serverId: savedReportId, status: "PENDING_SUBMISSION" },
+                        "SUBMIT",
+                    );
                     toast.info("Submission is pending sync and server validation.");
                     return;
                 }
-                throw new Error(
-                    result.message ||
-                        "Unable to submit patrol report.",
-                );
+                throw new Error(result.message || "Unable to submit patrol report.");
             }
 
             setIsSubmitted(true);
-
             setReportId(result.report_id);
             setSavedReportId(result.report_id);
-
-            toast.success(
-                "Patrol report submitted successfully.",
-            );
-
+            if (offline.ownerId) {
+                await markOfflineFieldFormSubmitted(
+                    offline.ownerId,
+                    "PATROL_REPORT",
+                    localId.current,
+                );
+            }
+            toast.success("Patrol report submitted successfully.");
             onSaved?.();
         } catch (error) {
-            const message =
-                error instanceof Error
-                    ? error.message
-                    : "Unable to submit patrol report.";
-
+            const message = error instanceof Error ? error.message : "Unable to submit patrol report.";
             toast.error(message);
         } finally {
             setIsSubmitting(false);
@@ -1266,6 +1705,287 @@ export function PatrolReportForm({
                                         disabled={formDisabled}
                                         className={textareaClassName}
                                     />
+                                </div>
+
+                                <div className="space-y-4 rounded-xl border border-border p-4 md:col-span-2">
+                                    <div className="flex flex-wrap items-center justify-between gap-3">
+                                        <div>
+                                            <h3 className="text-sm font-semibold">Wildlife Sightings, Photos & GPS</h3>
+                                            <p className="mt-1 text-xs text-muted-foreground">
+                                                Photos are saved with each sighting. AI suggestions remain unconfirmed until reviewed.
+                                            </p>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            onClick={() => void addWildlifeSighting()}
+                                            disabled={formDisabled}
+                                            className="inline-flex items-center gap-2 rounded-xl border border-border px-3 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50"
+                                        >
+                                            <Plus className="h-4 w-4" />
+                                            Add sighting
+                                        </button>
+                                    </div>
+
+                                    <input
+                                        ref={cameraInputRef}
+                                        type="file"
+                                        accept="image/jpeg,image/png,image/webp"
+                                        capture="environment"
+                                        multiple={!photoTarget?.photoId}
+                                        className="hidden"
+                                        onChange={(event) => {
+                                            void handleWildlifePhotoSelection(event.target.files);
+                                            event.target.value = "";
+                                        }}
+                                    />
+                                    <input
+                                        ref={galleryInputRef}
+                                        type="file"
+                                        accept="image/jpeg,image/png,image/webp"
+                                        multiple={!photoTarget?.photoId}
+                                        className="hidden"
+                                        onChange={(event) => {
+                                            void handleWildlifePhotoSelection(event.target.files);
+                                            event.target.value = "";
+                                        }}
+                                    />
+
+                                    {fields.wildlife_sightings.length === 0 && (
+                                        <p className="rounded-lg bg-muted/50 p-3 text-sm text-muted-foreground">
+                                            No individual wildlife sightings added.
+                                        </p>
+                                    )}
+
+                                    {fields.wildlife_sightings.map((sighting, sightingIndex) => (
+                                        <div key={sighting.sighting_id} className="space-y-4 rounded-xl bg-muted/30 p-4">
+                                            <div className="flex items-center justify-between gap-2">
+                                                <h4 className="text-sm font-semibold">Sighting {sightingIndex + 1}</h4>
+                                                <button
+                                                    type="button"
+                                                    aria-label={`Remove sighting ${sightingIndex + 1}`}
+                                                    onClick={() => void removeWildlifeSighting(sighting.sighting_id)}
+                                                    disabled={formDisabled}
+                                                    className="rounded-lg p-2 text-muted-foreground hover:bg-background hover:text-destructive disabled:opacity-50"
+                                                >
+                                                    <X className="h-4 w-4" />
+                                                </button>
+                                            </div>
+
+                                            <div className="grid gap-3 md:grid-cols-2">
+                                                <label className="text-xs font-medium text-muted-foreground">
+                                                    Common / local species name
+                                                    <input
+                                                        value={sighting.common_name}
+                                                        onChange={(event) => updateSighting(sighting.sighting_id, { common_name: event.target.value })}
+                                                        disabled={formDisabled}
+                                                        placeholder="Review or enter a species"
+                                                        className={`${inputClassName} mt-1`}
+                                                    />
+                                                </label>
+                                                <label className="text-xs font-medium text-muted-foreground">
+                                                    Scientific name
+                                                    <input
+                                                        value={sighting.scientific_name}
+                                                        onChange={(event) => updateSighting(sighting.sighting_id, { scientific_name: event.target.value })}
+                                                        disabled={formDisabled}
+                                                        placeholder="Optional"
+                                                        className={`${inputClassName} mt-1`}
+                                                    />
+                                                </label>
+                                                <label className="text-xs font-medium text-muted-foreground md:col-span-2">
+                                                    Manual species correction / notes
+                                                    <input
+                                                        value={sighting.manual_species_name}
+                                                        onChange={(event) => updateSighting(sighting.sighting_id, { manual_species_name: event.target.value })}
+                                                        disabled={formDisabled}
+                                                        placeholder="Enter the officer's corrected identification or notes"
+                                                        className={`${inputClassName} mt-1`}
+                                                    />
+                                                </label>
+                                            </div>
+
+                                            <div className="space-y-2">
+                                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                                    <div className="text-xs font-medium">
+                                                        <MapPin className="mr-1 inline h-3.5 w-3.5" />
+                                                        {sighting.latitude !== null && sighting.longitude !== null
+                                                            ? `${sighting.latitude.toFixed(6)}, ${sighting.longitude.toFixed(6)}`
+                                                            : "Location not captured"}
+                                                        {sighting.accuracy_m !== null && ` (accuracy ${Math.round(sighting.accuracy_m)} m)`}
+                                                    </div>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => void captureSightingLocation(sighting.sighting_id)}
+                                                        disabled={formDisabled}
+                                                        className="inline-flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium hover:bg-background disabled:opacity-50"
+                                                    >
+                                                        <MapPin className="h-3.5 w-3.5" />
+                                                        Capture current location
+                                                    </button>
+                                                </div>
+                                                <div className="grid gap-2 sm:grid-cols-3">
+                                                    {([
+                                                        ["latitude", "Latitude", -90, 90],
+                                                        ["longitude", "Longitude", -180, 180],
+                                                        ["accuracy_m", "Accuracy (m)", 0, undefined],
+                                                    ] as const).map(([key, label, min, max]) => (
+                                                        <label key={key} className="text-xs text-muted-foreground">
+                                                            {label}
+                                                            <input
+                                                                type="number"
+                                                                step="any"
+                                                                min={min}
+                                                                max={max}
+                                                                value={sighting[key] ?? ""}
+                                                                onChange={(event) => {
+                                                                    const value = event.target.value === "" ? null : Number(event.target.value);
+                                                                    updateSighting(sighting.sighting_id, { [key]: value !== null && !Number.isFinite(value) ? null : value });
+                                                                }}
+                                                                disabled={formDisabled}
+                                                                className={`${inputClassName} mt-1`}
+                                                            />
+                                                        </label>
+                                                    ))}
+                                                </div>
+                                            </div>
+
+                                            <div className="flex flex-wrap gap-2">
+                                                <button
+                                                    type="button"
+                                                    onClick={() => {
+                                                        setPhotoTarget({ sightingId: sighting.sighting_id });
+                                                        cameraInputRef.current?.click();
+                                                    }}
+                                                    disabled={formDisabled}
+                                                    className="inline-flex items-center gap-2 rounded-lg bg-emerald-700 px-3 py-2 text-xs font-medium text-white hover:bg-emerald-800 disabled:opacity-50"
+                                                >
+                                                    <Camera className="h-4 w-4" />
+                                                    Take photo
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => {
+                                                        setPhotoTarget({ sightingId: sighting.sighting_id });
+                                                        galleryInputRef.current?.click();
+                                                    }}
+                                                    disabled={formDisabled}
+                                                    className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-xs font-medium hover:bg-background disabled:opacity-50"
+                                                >
+                                                    <ImagePlus className="h-4 w-4" />
+                                                    Choose from gallery
+                                                </button>
+                                            </div>
+
+                                            {sighting.photos.length > 0 && (
+                                                <div className="space-y-3">
+                                                    {sighting.photos.map((photo) => (
+                                                        <div key={photo.photo_id} className="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-background p-3">
+                                                            <WildlifePhotoPreview photo={photo} />
+                                                            <div className="min-w-48 flex-1">
+                                                                <p className="text-xs font-medium">{photo.file_name}</p>
+                                                                <p className="mt-1 text-xs text-muted-foreground">
+                                                                    {photo.identification.status === "IDENTIFIED"
+                                                                        ? "AI suggestion - review before confirming"
+                                                                        : photo.identification.status === "UNCERTAIN" || photo.identification.status === "NOT_IDENTIFIABLE"
+                                                                            ? "Uncertain AI suggestion - not confirmed"
+                                                                            : photo.upload_status === "UPLOADING"
+                                                                                ? "Uploading wildlife photo..."
+                                                                                : photo.upload_status === "FAILED"
+                                                                                    ? `Upload failed: ${photo.upload_error ?? "retry sync"}`
+                                                                            : photo.identification.status === "FAILED"
+                                                                                ? `Identification failed: ${photo.identification.error ?? "try again"}`
+                                                                                : photo.evidence_id ? "Pending identification" : "Pending Sync"}
+                                                                </p>
+                                                                {photo.identification.common_name && (
+                                                                    <p className="mt-1 text-sm font-semibold">
+                                                                        {photo.identification.common_name}
+                                                                        {photo.identification.scientific_name && ` (${photo.identification.scientific_name})`}
+                                                                        {photo.identification.confidence !== null && ` - ${Math.round(photo.identification.confidence * 100)}%`}
+                                                                    </p>
+                                                                )}
+                                                                {photo.identification.candidates && photo.identification.candidates.length > 0 && (
+                                                                    <label className="mt-2 block text-xs text-muted-foreground">
+                                                                        Review alternative AI suggestion
+                                                                        <select
+                                                                            value=""
+                                                                            onChange={(event) => {
+                                                                                const candidate = photo.identification.candidates?.[Number(event.target.value)];
+                                                                                if (candidate) updateSighting(sighting.sighting_id, {
+                                                                                    common_name: candidate.common_name ?? "",
+                                                                                    scientific_name: candidate.scientific_name ?? "",
+                                                                                });
+                                                                            }}
+                                                                            disabled={formDisabled}
+                                                                            className={`${inputClassName} mt-1`}
+                                                                        >
+                                                                            <option value="">Select a candidate</option>
+                                                                            {photo.identification.candidates.map((candidate, candidateIndex) => (
+                                                                                <option key={`${photo.photo_id}-${candidateIndex}`} value={candidateIndex}>
+                                                                                    {[candidate.common_name, candidate.scientific_name].filter(Boolean).join(" - ")}
+                                                                                    {candidate.confidence !== null && ` (${Math.round(candidate.confidence * 100)}%)`}
+                                                                                </option>
+                                                                            ))}
+                                                                        </select>
+                                                                    </label>
+                                                                )}
+                                                            </div>
+                                                            {photo.file && photo.identification.status !== "IDENTIFIED" && (
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={async () => {
+                                                                        const record: OfflineFieldRecord = {
+                                                                            ownerId: offline.ownerId ?? "",
+                                                                            module: "PATROL_REPORT",
+                                                                            localId: localId.current,
+                                                                            serverId: reportId,
+                                                                            payload: {
+                                                                                ...fields,
+                                                                                wildlife_sightings: serializableWildlifeSightings(fields.wildlife_sightings),
+                                                                            },
+                                                                            status: "DRAFT",
+                                                                            syncError: null,
+                                                                            updatedAt: new Date().toISOString(),
+                                                                        };
+                                                                        try {
+                                                                            await queueWildlifePhotos(record);
+                                                                            toast.info("Wildlife photo queued for upload and identification.");
+                                                                        } catch (error) {
+                                                                            toast.error(error instanceof Error ? error.message : "Unable to retry wildlife identification.");
+                                                                        }
+                                                                    }}
+                                                                    disabled={formDisabled || !offline.ownerId}
+                                                                    className="inline-flex items-center gap-1 rounded-lg border border-border px-2.5 py-1.5 text-xs hover:bg-muted disabled:opacity-50"
+                                                                >
+                                                                    <RefreshCw className="h-3.5 w-3.5" />
+                                                                    Retry identification
+                                                                </button>
+                                                            )}
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => {
+                                                                    setPhotoTarget({ sightingId: sighting.sighting_id, photoId: photo.photo_id });
+                                                                    galleryInputRef.current?.click();
+                                                                }}
+                                                                disabled={formDisabled}
+                                                                className="rounded-lg border border-border px-2.5 py-1.5 text-xs hover:bg-muted disabled:opacity-50"
+                                                            >
+                                                                Replace
+                                                            </button>
+                                                            <button
+                                                                type="button"
+                                                                aria-label={`Remove ${photo.file_name}`}
+                                                                onClick={() => void removeWildlifePhoto(sighting.sighting_id, photo.photo_id)}
+                                                                disabled={formDisabled}
+                                                                className="rounded-lg p-2 text-muted-foreground hover:bg-muted hover:text-destructive disabled:opacity-50"
+                                                            >
+                                                                <Trash2 className="h-4 w-4" />
+                                                            </button>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+                                    ))}
                                 </div>
 
                                 <div>

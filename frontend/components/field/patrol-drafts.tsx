@@ -14,6 +14,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { apiRequest } from "@/lib/api";
+import type { WildlifeSighting } from "@/lib/patrol-wildlife";
 
 type PatrolReport = {
   report_id: string;
@@ -34,6 +35,7 @@ type PatrolReport = {
   purpose: string | null;
   observations: string | null;
   wildlife_sighting: string | null;
+  wildlife_sightings: WildlifeSighting[];
   illegal_activity: string | null;
   action_taken: string | null;
   incident_details: string | null;

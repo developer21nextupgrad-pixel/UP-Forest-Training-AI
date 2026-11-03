@@ -805,6 +805,12 @@ class FieldPatrolReport(Base):
         nullable=True,
     )
 
+    wildlife_sightings: Mapped[list | None] = mapped_column(
+        JSON,
+        nullable=True,
+        default=list,
+    )
+
     illegal_activity: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,

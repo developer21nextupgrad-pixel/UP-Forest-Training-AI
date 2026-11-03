@@ -115,7 +115,7 @@ export async function apiRequest<T>(
     const headers = new Headers(init.headers);
 
     const token = getAccessToken();
-    if (token && !headers.has("Authorization")) {
+    if (token) {
       headers.set("Authorization", `Bearer ${token}`);
     }
 

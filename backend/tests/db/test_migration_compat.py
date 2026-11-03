@@ -149,6 +149,141 @@ def test_add_missing_column_to_existing_table(migration_connection):
     ).one() == (1, None)
 
 
+def test_patrol_wildlife_migration_preserves_legacy_singular_column(
+    migration_connection,
+):
+    connection = migration_connection
+    connection.exec_driver_sql(
+        "CREATE TABLE field_patrol_reports "
+        "(id INTEGER PRIMARY KEY, wildlife_sighting TEXT)"
+    )
+    connection.exec_driver_sql(
+        "INSERT INTO field_patrol_reports (id, wildlife_sighting) "
+        "VALUES (1, 'Legacy wildlife notes')"
+    )
+    migration_path = (
+        Path(__file__).resolve().parents[2]
+        / "alembic"
+        / "versions"
+        / "4f7b19c2a6d1_reconcile_patrol_wildlife_sightings.py"
+    )
+    upgrade = run_path(str(migration_path))["upgrade"]
+
+    upgrade()
+    upgrade()
+
+    columns = {
+        column["name"]: column
+        for column in sa.inspect(connection).get_columns("field_patrol_reports")
+    }
+    assert "wildlife_sighting" in columns
+    assert "wildlife_sightings" in columns
+    assert isinstance(columns["wildlife_sightings"]["type"], sa.JSON)
+    assert connection.exec_driver_sql(
+        "SELECT wildlife_sighting, wildlife_sightings "
+        "FROM field_patrol_reports WHERE id = 1"
+    ).one() == ("Legacy wildlife notes", None)
+
+
+def test_patrol_schema_reconciliation_preserves_rows_and_adds_missing_columns(
+    migration_connection, monkeypatch
+):
+    connection = migration_connection
+    connection.exec_driver_sql(
+        "CREATE TABLE field_patrol_reports "
+        "(id INTEGER PRIMARY KEY, officer_id INTEGER NOT NULL, "
+        "wildlife_sighting TEXT, review_status VARCHAR(30) NOT NULL)"
+    )
+    connection.exec_driver_sql(
+        "INSERT INTO field_patrol_reports "
+        "(id, officer_id, wildlife_sighting, review_status) "
+        "VALUES (1, 17, 'Legacy patrol notes', 'PENDING')"
+    )
+    alter_calls = []
+    monkeypatch.setattr(
+        migration_compat.op,
+        "alter_column",
+        lambda *args, **kwargs: alter_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        migration_compat.op,
+        "create_unique_constraint",
+        lambda name, table, columns: migration_compat.op.create_index(
+            name, table, columns, unique=True
+        ),
+    )
+    migration_path = (
+        Path(__file__).resolve().parents[2]
+        / "alembic"
+        / "versions"
+        / "c6e8f91a2d43_reconcile_patrol_report_schema.py"
+    )
+    run_path(str(migration_path))["upgrade"]()
+
+    columns = {
+        column["name"]: column
+        for column in sa.inspect(connection).get_columns("field_patrol_reports")
+    }
+    assert {
+        "client_operation_id",
+        "wildlife_sightings",
+        "wildlife_sighting",
+        "review_status",
+    } <= columns.keys()
+    assert connection.exec_driver_sql(
+        "SELECT officer_id, wildlife_sighting, review_status, "
+        "client_operation_id, wildlife_sightings "
+        "FROM field_patrol_reports WHERE id = 1"
+    ).one() == (17, "Legacy patrol notes", "PENDING", None, None)
+    assert len(alter_calls) == 1
+    assert alter_calls[0][0][:2] == ("field_patrol_reports", "review_status")
+    assert str(alter_calls[0][1]["server_default"]) == "'PENDING'"
+    assert any(
+        index["name"] == "uq_patrol_report_officer_operation" and index["unique"]
+        for index in sa.inspect(connection).get_indexes("field_patrol_reports")
+    )
+
+
+def test_patrol_review_migration_repairs_missing_server_default(
+    migration_connection, monkeypatch
+):
+    connection = migration_connection
+    connection.exec_driver_sql(
+        "CREATE TABLE field_patrol_reports ("
+        "id INTEGER PRIMARY KEY, review_status VARCHAR(30) NOT NULL, "
+        "review_comment TEXT, reviewed_by CHAR(32), reviewed_at DATETIME)"
+    )
+    connection.exec_driver_sql(
+        "INSERT INTO field_patrol_reports (id, review_status) "
+        "VALUES (1, 'PENDING')"
+    )
+    alter_calls = []
+    monkeypatch.setattr(
+        migration_compat.op,
+        "alter_column",
+        lambda *args, **kwargs: alter_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        migration_compat,
+        "create_foreign_key_if_compatible",
+        lambda *args, **kwargs: None,
+    )
+    migration_path = (
+        Path(__file__).resolve().parents[2]
+        / "alembic"
+        / "versions"
+        / "567b86863b14_add_patrol_report_review_fields.py"
+    )
+    run_path(str(migration_path))["upgrade"]()
+
+    assert len(alter_calls) == 1
+    assert alter_calls[0][0][:2] == ("field_patrol_reports", "review_status")
+    assert str(alter_calls[0][1]["server_default"]) == "'PENDING'"
+    assert connection.exec_driver_sql(
+        "SELECT id, review_status FROM field_patrol_reports"
+    ).one() == (1, "PENDING")
+
+
 def test_daily_diary_migration_adds_and_reuses_idempotency_column(
     migration_connection, monkeypatch
 ):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import date, time,datetime
 from uuid import UUID
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -28,10 +28,54 @@ class PatrolReportFields(BaseModel):
     purpose: str | None = None
     observations: str | None = None
     wildlife_sighting: str | None = None
+    wildlife_sightings: list["PatrolWildlifeSighting"] = Field(default_factory=list, max_length=100)
     illegal_activity: str | None = None
     action_taken: str | None = None
     incident_details: str | None = None
     additional_remarks: str | None = None
+
+
+class PatrolWildlifeIdentification(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    status: Literal["PENDING", "IDENTIFIED", "UNCERTAIN", "NOT_IDENTIFIABLE", "FAILED"] = "PENDING"
+    common_name: str | None = Field(default=None, max_length=300)
+    scientific_name: str | None = Field(default=None, max_length=300)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    error: str | None = Field(default=None, max_length=500)
+    candidates: list["PatrolWildlifeCandidate"] = Field(default_factory=list, max_length=10)
+
+
+class PatrolWildlifeCandidate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    common_name: str | None = Field(default=None, max_length=300)
+    scientific_name: str | None = Field(default=None, max_length=300)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class PatrolWildlifePhoto(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    photo_id: UUID
+    file_name: str = Field(max_length=255)
+    mime_type: Literal["image/jpeg", "image/png", "image/webp"]
+    file_size: int = Field(ge=0, le=10 * 1024 * 1024)
+    evidence_id: UUID | None = None
+    identification: PatrolWildlifeIdentification = Field(default_factory=PatrolWildlifeIdentification)
+
+
+class PatrolWildlifeSighting(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    sighting_id: UUID
+    common_name: str = Field(default="", max_length=300)
+    scientific_name: str = Field(default="", max_length=300)
+    manual_species_name: str = Field(default="", max_length=500)
+    latitude: float | None = Field(default=None, ge=-90.0, le=90.0)
+    longitude: float | None = Field(default=None, ge=-180.0, le=180.0)
+    accuracy_m: float | None = Field(default=None, ge=0.0)
+    photos: list[PatrolWildlifePhoto] = Field(default_factory=list, max_length=30)
 
 
 class PatrolReportExtractRequest(BaseModel):
@@ -129,6 +173,7 @@ class PatrolReportDraftItem(BaseModel):
     purpose: str | None = None
     observations: str | None = None
     wildlife_sighting: str | None = None
+    wildlife_sightings: list[PatrolWildlifeSighting] = Field(default_factory=list)
     illegal_activity: str | None = None
     action_taken: str | None = None
     incident_details: str | None = None

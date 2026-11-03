@@ -362,6 +362,8 @@ async def test_evidence_upload_retry_with_same_operation_id_does_not_duplicate_f
                 ),
                 description=None,
                 client_operation_id="evidence-operation-1",
+                wildlife_sighting_id=None,
+                wildlife_photo_id=None,
                 user=officer,
                 session=session,
             )

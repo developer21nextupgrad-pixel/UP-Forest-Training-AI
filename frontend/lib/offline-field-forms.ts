@@ -16,7 +16,7 @@ const MAX_RETRIES = 5;
 
 export type OfflineFieldModule = "PATROL_REPORT" | "INCIDENT_REPORT" | "OFFENCE_SEIZURE";
 export type FieldSyncState = "Online" | "Offline" | "Pending Sync" | "Syncing" | "Synced" | "Sync Failed";
-export type FieldOperationKind = "CREATE" | "UPDATE" | "SUBMIT" | "EVIDENCE_UPLOAD";
+export type FieldOperationKind = "CREATE" | "UPDATE" | "SUBMIT" | "EVIDENCE_UPLOAD" | "EVIDENCE_IDENTIFY" | "EVIDENCE_DELETE";
 
 export type OfflineFieldRecord = {
   ownerId: string;
@@ -36,7 +36,17 @@ type Operation = {
   localId: string;
   kind: FieldOperationKind;
   payload?: Record<string, unknown>;
-  file?: { blob: Blob; fileName: string; mimeType: string; description: string | null };
+  file?: {
+    blob: Blob;
+    fileName: string;
+    mimeType: string;
+    description: string | null;
+    wildlifeSightingId?: string;
+    wildlifePhotoId?: string;
+    clientOperationId?: string;
+  };
+  evidenceId?: string;
+  retryable?: boolean;
   createdAt: number;
   revision: number;
   attempts: number;
@@ -173,6 +183,22 @@ export async function getOfflineFormRecord(
   );
 }
 
+export async function markOfflineFieldFormSubmitted(
+  ownerId: string,
+  module: OfflineFieldModule,
+  localId: string,
+): Promise<void> {
+  const record = await getOfflineFormRecord(ownerId, module, localId);
+  if (!record) return;
+  await saveRecord({
+    ...record,
+    status: "SUBMITTED",
+    syncError: null,
+    updatedAt: new Date().toISOString(),
+  });
+  notifyOfflineQueueChanged();
+}
+
 export async function getOfflineFieldFormRecords(
   ownerId: string,
   module: OfflineFieldModule,
@@ -218,7 +244,7 @@ export async function enqueueOfflineFieldOperation(
       Date.now(),
       ...all.filter((item) => item?.ownerId === ownerId && item.module === module).map((item) => item.createdAt + 1),
     );
-    const payload = kind === "SUBMIT" || kind === "EVIDENCE_UPLOAD"
+    const payload = kind === "SUBMIT" || kind === "EVIDENCE_UPLOAD" || kind === "EVIDENCE_IDENTIFY" || kind === "EVIDENCE_DELETE"
       ? undefined
       : {
           ...record.payload,
@@ -246,17 +272,96 @@ export async function enqueueOfflineFieldOperation(
   notifyOfflineQueueChanged();
 }
 
+export async function persistPatrolMetadataBeforeWildlifeEvidence(
+  ownerId: string,
+  record: OfflineFieldRecord,
+): Promise<"saved" | "queued"> {
+  if (record.module !== "PATROL_REPORT" || record.ownerId !== ownerId) {
+    throw new Error("Wildlife evidence requires the owning officer's Patrol Report.");
+  }
+  if (!navigator.onLine || !record.serverId) {
+    await enqueueOfflineFieldOperation(
+      ownerId,
+      "PATROL_REPORT",
+      record,
+      record.serverId ? "UPDATE" : "CREATE",
+    );
+    return "queued";
+  }
+
+  const result = await apiRequest<Record<string, unknown>>(
+    `${CONFIG.PATROL_REPORT.path}/${record.serverId}`,
+    { method: "PUT", body: JSON.stringify(record.payload) },
+  );
+  if (result.success) return "saved";
+  if (!navigator.onLine || fieldSyncableFailure(result)) {
+    await enqueueOfflineFieldOperation(ownerId, "PATROL_REPORT", record, "UPDATE");
+    return "queued";
+  }
+  throw new Error(result.message || "Unable to save Patrol Report wildlife metadata.");
+}
+
 export async function enqueueOfflineEvidenceUpload(
   ownerId: string,
   record: OfflineFieldRecord,
   file: File,
   description: string | null,
   clientOperationId = createFieldLocalId(),
+  wildlife?: { sightingId: string; photoId: string },
 ): Promise<void> {
-  const moduleName: OfflineFieldModule = "OFFENCE_SEIZURE";
+  const moduleName = record.module;
+  if (moduleName !== "OFFENCE_SEIZURE" &&
+    (moduleName !== "PATROL_REPORT" || !wildlife?.sightingId || !wildlife.photoId)) {
+    throw new Error("Wildlife evidence uploads require a Patrol Report sighting and photo ID.");
+  }
   await withStores([RECORDS, OPERATIONS], "readwrite", async (stores) => {
     const operationStore = stores[OPERATIONS];
     const all = await requestValue(operationStore.getAll()) as Operation[];
+    const operationId = `evidence:${record.localId}:${clientOperationId}`;
+    const existing = await requestValue(operationStore.get([ownerId, moduleName, operationId])) as Operation | undefined;
+    if (existing) {
+      if (
+        moduleName === "PATROL_REPORT" &&
+        wildlife &&
+        (
+          !existing.file ||
+          existing.file.clientOperationId !== clientOperationId ||
+          existing.file.wildlifeSightingId !== wildlife.sightingId ||
+          existing.file.wildlifePhotoId !== wildlife.photoId
+        )
+      ) {
+        throw new Error("This wildlife upload operation ID is already bound to another photo.");
+      }
+      if (existing.status === "FAILED" || existing.status === "AUTH_REQUIRED") {
+        await requestValue(operationStore.put({
+          ...existing,
+          file: {
+            blob: file,
+            fileName: file.name,
+            mimeType: file.type,
+            description,
+            ...(wildlife ? {
+              wildlifeSightingId: wildlife.sightingId,
+              wildlifePhotoId: wildlife.photoId,
+              clientOperationId,
+            } : {}),
+          },
+          revision: existing.revision + 1,
+          attempts: 0,
+          status: "PENDING",
+          error: null,
+        } satisfies Operation));
+      }
+      await requestValue(stores[RECORDS].put({
+        ...record,
+        ownerId,
+        module: moduleName,
+        payload: moduleName === "PATROL_REPORT" && wildlife
+          ? updateWildlifePhotoUpload(record, wildlife.sightingId, wildlife.photoId, "PENDING", null).payload
+          : record.payload,
+      }));
+      return;
+    }
     const createdAt = Math.max(
       Date.now(),
       ...      all.filter((item) => item?.ownerId === ownerId && item.module === moduleName)
@@ -265,16 +370,158 @@ export async function enqueueOfflineEvidenceUpload(
     await requestValue(operationStore.put({
       ownerId,
       module: moduleName,
-      id: `evidence:${record.localId}:${clientOperationId}`,
+      id: operationId,
       localId: record.localId,
       kind: "EVIDENCE_UPLOAD",
-      file: { blob: file, fileName: file.name, mimeType: file.type, description },
+      file: {
+        blob: file,
+        fileName: file.name,
+        mimeType: file.type,
+        description,
+        ...(wildlife ? {
+          wildlifeSightingId: wildlife.sightingId,
+          wildlifePhotoId: wildlife.photoId,
+          clientOperationId,
+        } : {}),
+      },
       createdAt,
       revision: 1,
       attempts: 0,
       status: "PENDING",
       error: null,
     } satisfies Operation));
+    await requestValue(stores[RECORDS].put({
+      ...record,
+      ownerId,
+      module: moduleName,
+      syncError: null,
+      payload: moduleName === "PATROL_REPORT" && wildlife
+        ? updateWildlifePhotoUpload(record, wildlife.sightingId, wildlife.photoId, "PENDING", null).payload
+        : record.payload,
+    }));
+  });
+  notifyOfflineQueueChanged();
+}
+
+export async function enqueueOfflineWildlifeIdentification(
+  ownerId: string,
+  record: OfflineFieldRecord,
+  evidenceId: string,
+  sightingId: string,
+  photoId: string,
+): Promise<Operation> {
+  if (record.module !== "PATROL_REPORT" || !record.serverId || !evidenceId || !sightingId || !photoId) {
+    throw new Error("Wildlife identification requires a saved Patrol Report and uploaded photo.");
+  }
+  const operationId = `wildlife-identify:${record.localId}:${photoId}`;
+  const operation = await withStores([RECORDS, OPERATIONS, LOCKS], "readwrite", async (stores) => {
+    const operationStore = stores[OPERATIONS];
+    const existing = await requestValue(operationStore.get([ownerId, record.module, operationId])) as Operation | undefined;
+    let queuedOperation: Operation;
+    if (existing) {
+      if (existing.status === "FAILED" || existing.status === "AUTH_REQUIRED") {
+        queuedOperation = {
+          ...existing,
+          evidenceId,
+          payload: { wildlifeSightingId: sightingId, wildlifePhotoId: photoId },
+          revision: existing.revision + 1,
+          attempts: 0,
+          status: "PENDING",
+          error: null,
+          retryable: undefined,
+        };
+        await requestValue(operationStore.put(queuedOperation));
+      } else {
+        queuedOperation = existing;
+      }
+      await requestValue(stores[RECORDS].put({ ...record, ownerId, syncError: null }));
+    } else {
+      const all = await requestValue(operationStore.getAll()) as Operation[];
+      const createdAt = Math.max(
+        Date.now(),
+        ...all.filter((item) => item?.ownerId === ownerId && item.module === record.module)
+          .map((item) => item.createdAt + 1),
+      );
+      const created: Operation = {
+        ownerId,
+        module: record.module,
+        id: operationId,
+        localId: record.localId,
+        kind: "EVIDENCE_IDENTIFY",
+        evidenceId,
+        payload: { wildlifeSightingId: sightingId, wildlifePhotoId: photoId },
+        createdAt,
+        revision: 1,
+        attempts: 0,
+        status: "PENDING",
+        error: null,
+      };
+      await requestValue(operationStore.put(created));
+      await requestValue(stores[RECORDS].put({ ...record, ownerId, syncError: null }));
+      queuedOperation = created;
+    }
+    const key = `field-sync:${ownerId}:${record.module}`;
+    const lock = await requestValue(stores[LOCKS].get(key)) as
+      { token: string; expiresAt: number; wakeRequested?: boolean } | undefined;
+    if (lock && lock.expiresAt > Date.now()) {
+      await requestValue(stores[LOCKS].put({ ...lock, wakeRequested: true }));
+    }
+    return queuedOperation;
+  });
+  notifyOfflineQueueChanged();
+  return operation;
+}
+
+export async function cancelOfflineEvidenceUpload(
+  ownerId: string,
+  module: OfflineFieldModule,
+  localId: string,
+  clientOperationId: string,
+): Promise<void> {
+  const operationId = `evidence:${localId}:${clientOperationId}`;
+  await withStores([OPERATIONS], "readwrite", async ({ [OPERATIONS]: store }) => {
+    const operation = await requestValue(store.get([ownerId, module, operationId])) as Operation | undefined;
+    if (operation?.status === "SYNCING") {
+      throw new Error("This wildlife photo is currently syncing. Wait for sync to finish before removing it.");
+    }
+    if (operation) await requestValue(store.delete([ownerId, module, operationId]));
+  });
+  notifyOfflineQueueChanged();
+}
+
+export async function enqueueOfflineEvidenceDelete(
+  ownerId: string,
+  record: OfflineFieldRecord,
+  evidenceId: string,
+): Promise<void> {
+  const moduleName = record.module;
+  const operationId = `evidence-delete:${record.localId}:${evidenceId}`;
+  await withStores([RECORDS, OPERATIONS], "readwrite", async (stores) => {
+    const operationStore = stores[OPERATIONS];
+    const existing = await requestValue(
+      operationStore.get([ownerId, moduleName, operationId]),
+    ) as Operation | undefined;
+    if (!existing) {
+      const all = await requestValue(operationStore.getAll()) as Operation[];
+      const createdAt = Math.max(
+        Date.now(),
+        ...all.filter((item) => item?.ownerId === ownerId && item.module === moduleName)
+          .map((item) => item.createdAt + 1),
+      );
+      await requestValue(operationStore.put({
+        ownerId,
+        module: moduleName,
+        id: operationId,
+        localId: record.localId,
+        kind: "EVIDENCE_DELETE",
+        evidenceId,
+        createdAt,
+        revision: 1,
+        attempts: 0,
+        status: "PENDING",
+        error: null,
+      } satisfies Operation));
+    }
     await requestValue(stores[RECORDS].put({ ...record, ownerId, module: moduleName, syncError: null }));
   });
   notifyOfflineQueueChanged();
@@ -307,18 +554,31 @@ async function acquireLock(ownerId: string, module: OfflineFieldModule): Promise
   const token = createFieldLocalId();
   const key = `field-sync:${ownerId}:${module}`;
   return withStores([LOCKS], "readwrite", async ({ [LOCKS]: store }) => {
-    const current = await requestValue(store.get(key)) as { expiresAt: number } | undefined;
-    if (current && current.expiresAt > Date.now()) return null;
+    const current = await requestValue(store.get(key)) as
+      { expiresAt: number; wakeRequested?: boolean } | undefined;
+    if (current && current.expiresAt > Date.now()) {
+      await requestValue(store.put({ ...current, wakeRequested: true }));
+      return null;
+    }
     await requestValue(store.put({ key, token, expiresAt: Date.now() + LOCK_TTL }));
     return token;
   });
 }
 
-async function releaseLock(ownerId: string, module: OfflineFieldModule, token: string): Promise<void> {
+async function releaseLock(
+  ownerId: string,
+  module: OfflineFieldModule,
+  token: string,
+  continueIfWakeRequested = false,
+): Promise<boolean> {
   const key = `field-sync:${ownerId}:${module}`;
-  await withStores([LOCKS], "readwrite", async ({ [LOCKS]: store }) => {
-    const current = await requestValue(store.get(key)) as { token: string } | undefined;
-    if (current?.token === token) await requestValue(store.delete(key));
+  return withStores([LOCKS], "readwrite", async ({ [LOCKS]: store }) => {
+    const current = await requestValue(store.get(key)) as
+      { token: string; expiresAt: number; wakeRequested?: boolean } | undefined;
+    if (current?.token !== token) return false;
+    const wakeRequested = continueIfWakeRequested && current.wakeRequested === true;
+    await requestValue(store.delete(key));
+    return wakeRequested;
   });
 }
 
@@ -332,7 +592,11 @@ async function completeOperation(operation: Operation, record: OfflineFieldRecor
       return;
     }
     await requestValue(operationStore.delete(key));
-    const status = operation.kind === "SUBMIT" ? "SUBMITTED" : record.status === "PENDING_SUBMISSION" ? "PENDING_SUBMISSION" : "DRAFT";
+    const status = operation.kind === "SUBMIT" || record.status === "SUBMITTED"
+      ? "SUBMITTED"
+      : record.status === "PENDING_SUBMISSION"
+        ? "PENDING_SUBMISSION"
+        : "DRAFT";
     await requestValue(stores[RECORDS].put({
       ...record,
       serverId: serverId ?? record.serverId,
@@ -344,7 +608,70 @@ async function completeOperation(operation: Operation, record: OfflineFieldRecor
   notifyOfflineQueueChanged();
 }
 
-async function syncOne(operation: Operation): Promise<"ok" | "auth" | "failed"> {
+function updateWildlifePhotoIdentification(
+  record: OfflineFieldRecord,
+  sightingId: string,
+  photoId: string,
+  identification: Record<string, unknown>,
+): OfflineFieldRecord {
+  const sightings = Array.isArray(record.payload.wildlife_sightings)
+    ? record.payload.wildlife_sightings as Array<Record<string, unknown>>
+    : [];
+  return {
+    ...record,
+    payload: {
+      ...record.payload,
+      wildlife_sightings: sightings.map((sighting) => {
+        if (sighting.sighting_id !== sightingId || !Array.isArray(sighting.photos)) return sighting;
+        return {
+          ...sighting,
+          photos: (sighting.photos as Array<Record<string, unknown>>).map((photo) =>
+            photo.photo_id === photoId
+              ? { ...photo, identification }
+              : photo,
+          ),
+        };
+      }),
+    },
+  };
+}
+
+function updateWildlifePhotoUpload(
+  record: OfflineFieldRecord,
+  sightingId: string,
+  photoId: string,
+  status: "PENDING" | "UPLOADING" | "UPLOADED" | "FAILED",
+  error: string | null,
+  evidenceId?: string,
+): OfflineFieldRecord {
+  const sightings = Array.isArray(record.payload.wildlife_sightings)
+    ? record.payload.wildlife_sightings as Array<Record<string, unknown>>
+    : [];
+  return {
+    ...record,
+    payload: {
+      ...record.payload,
+      wildlife_sightings: sightings.map((sighting) => {
+        if (sighting.sighting_id !== sightingId || !Array.isArray(sighting.photos)) return sighting;
+        return {
+          ...sighting,
+          photos: (sighting.photos as Array<Record<string, unknown>>).map((photo) =>
+            photo.photo_id === photoId
+              ? {
+                  ...photo,
+                  upload_status: status,
+                  upload_error: error,
+                  ...(evidenceId ? { evidence_id: evidenceId } : {}),
+                }
+              : photo,
+          ),
+        };
+      }),
+    },
+  };
+}
+
+async function syncOne(operation: Operation): Promise<"ok" | "auth" | "failed" | "deferred"> {
   const activeUser = getStoredUser();
   if (activeUser?.role !== "FIELD_OFFICER" || activeUser.id !== operation.ownerId) {
     await markOperation(operation.ownerId, operation.module, {
@@ -360,6 +687,21 @@ async function syncOne(operation: Operation): Promise<"ok" | "auth" | "failed"> 
     return "failed";
   }
   const config = CONFIG[operation.module];
+  if (
+    operation.module === "PATROL_REPORT" &&
+    (operation.kind === "EVIDENCE_UPLOAD" || operation.kind === "EVIDENCE_IDENTIFY")
+  ) {
+    const hasPendingReportSave = await withStores([OPERATIONS], "readonly", async ({ [OPERATIONS]: store }) => {
+      const all = await requestValue(store.getAll()) as Operation[];
+      return all.some((item) =>
+        item?.ownerId === operation.ownerId &&
+        item.module === operation.module &&
+        item.localId === operation.localId &&
+        (item.kind === "CREATE" || item.kind === "UPDATE"),
+      );
+    });
+    if (hasPendingReportSave) return "deferred";
+  }
   const isIncidentUpdate =
     operation.module === "INCIDENT_REPORT" && operation.kind === "UPDATE";
   const isIncidentCreateRecovery = isIncidentUpdate && !record.serverId;
@@ -402,6 +744,27 @@ async function syncOne(operation: Operation): Promise<"ok" | "auth" | "failed"> 
     }
     path = `${config.path}/${record.serverId}/submit`;
     method = "POST";
+  } else if (operation.kind === "EVIDENCE_DELETE") {
+    if (!operation.evidenceId) {
+      await markOperation(operation.ownerId, operation.module, {
+        ...operation, status: "FAILED", error: "The queued evidence deletion is missing its evidence ID.",
+      });
+      return "failed";
+    }
+    path = `/api/v1/field/evidence/${operation.evidenceId}`;
+    method = "DELETE";
+  } else if (operation.kind === "EVIDENCE_IDENTIFY") {
+    const sightingId = operation.payload?.wildlifeSightingId;
+    const photoId = operation.payload?.wildlifePhotoId;
+    if (!record.serverId || !operation.evidenceId || typeof sightingId !== "string" || typeof photoId !== "string") {
+      await markOperation(operation.ownerId, operation.module, {
+        ...operation, status: "FAILED", retryable: false,
+        error: "The queued wildlife identification is missing its report, evidence, or sighting ID.",
+      });
+      return "failed";
+    }
+    path = `/api/v1/field/forms/patrol/${record.serverId}/wildlife-identify`;
+    method = "POST";
   } else {
     if (!record.serverId) {
       await markOperation(operation.ownerId, operation.module, {
@@ -430,22 +793,156 @@ async function syncOne(operation: Operation): Promise<"ok" | "auth" | "failed"> 
       error: null,
     });
     let requestBody: BodyInit | undefined = body;
+    if (operationKind === "EVIDENCE_UPLOAD" && operation.module === "PATROL_REPORT") {
+      const sightingId = operation.file?.wildlifeSightingId;
+      const photoId = operation.file?.wildlifePhotoId;
+      const sightings = Array.isArray(record.payload.wildlife_sightings)
+        ? record.payload.wildlife_sightings as Array<Record<string, unknown>>
+        : [];
+      const targetSighting = sightings.find((item) => item.sighting_id === sightingId);
+      const photos = Array.isArray(targetSighting?.photos)
+        ? targetSighting.photos as Array<Record<string, unknown>>
+        : [];
+      if (
+        !record.serverId ||
+        typeof sightingId !== "string" ||
+        typeof photoId !== "string" ||
+        !photos.some((photo) => photo.photo_id === photoId)
+      ) {
+        const error = "The saved Patrol Report is missing the queued wildlife sighting or photo.";
+        await markOperation(operation.ownerId, operation.module, {
+          ...operation, status: "FAILED", retryable: false, error,
+        });
+        if (typeof sightingId === "string" && typeof photoId === "string") {
+          await saveRecord(updateWildlifePhotoUpload(record, sightingId, photoId, "FAILED", error));
+          notifyOfflineQueueChanged();
+        }
+        return "failed";
+      }
+      record = updateWildlifePhotoUpload(record, sightingId, photoId, "UPLOADING", null);
+      await saveRecord(record);
+      notifyOfflineQueueChanged();
+    }
+    if (operationKind === "EVIDENCE_IDENTIFY") {
+      const sightingId = operation.payload?.wildlifeSightingId;
+      const photoId = operation.payload?.wildlifePhotoId;
+      if (typeof sightingId !== "string" || typeof photoId !== "string" || !operation.evidenceId) {
+        await markOperation(operation.ownerId, operation.module, {
+          ...operation, status: "FAILED", retryable: false,
+          error: "The queued wildlife identification is missing its evidence or sighting association.",
+        });
+        return "failed";
+      }
+      requestBody = new FormData();
+      requestBody.append("evidence_id", operation.evidenceId);
+      requestBody.append("wildlife_sighting_id", sightingId);
+      requestBody.append("wildlife_photo_id", photoId);
+      record = updateWildlifePhotoIdentification(record, sightingId, photoId, {
+        status: "PENDING",
+        common_name: null,
+        scientific_name: null,
+        confidence: null,
+        error: null,
+      });
+      await saveRecord(record);
+    }
     if (operationKind === "EVIDENCE_UPLOAD") {
       if (!operation.file) {
+        const error = "The queued evidence file is missing; the operation was retained.";
         await markOperation(operation.ownerId, operation.module, {
-          ...operation, status: "FAILED", error: "The queued evidence file is missing; the operation was retained.",
+          ...operation, status: "FAILED", error,
         });
         return "failed";
       }
       const formData = new FormData();
-      formData.append("report_type", "OFFENCE_SEIZURE");
+      formData.append("report_type", operation.module === "PATROL_REPORT" ? "PATROL" : "OFFENCE_SEIZURE");
       formData.append("report_id", record.serverId!);
       formData.append("file", operation.file.blob, operation.file.fileName);
-      formData.append("client_operation_id", operation.id);
+      formData.append("client_operation_id", operation.file.clientOperationId ?? operation.id);
       if (operation.file.description) formData.append("description", operation.file.description);
+      if (operation.module === "PATROL_REPORT") {
+        if (!operation.file.wildlifeSightingId || !operation.file.wildlifePhotoId) {
+          const error = "The queued wildlife photo is missing its sighting association.";
+          await markOperation(operation.ownerId, operation.module, {
+            ...operation, status: "FAILED", error,
+          });
+          notifyOfflineQueueChanged();
+          return "failed";
+        }
+        formData.append("wildlife_sighting_id", operation.file.wildlifeSightingId);
+        formData.append("wildlife_photo_id", operation.file.wildlifePhotoId);
+      }
       requestBody = formData;
     }
-    let response = await apiRequest<Record<string, unknown>>(path, { method, body: requestBody, timeoutMs: 15_000 });
+    let response = await apiRequest<Record<string, unknown>>(path, {
+      method,
+      body: requestBody,
+      timeoutMs: operationKind === "EVIDENCE_IDENTIFY" ? 120_000 : 15_000,
+    });
+    const alreadyDeleted = operation.kind === "EVIDENCE_DELETE" && response.status === 404;
+    if (response.success && operation.kind === "EVIDENCE_UPLOAD" && operation.module === "PATROL_REPORT") {
+      const evidence = response.data.evidence as Record<string, unknown> | undefined;
+      const evidenceId = evidence?.id;
+      if (typeof evidenceId !== "string" || !operation.file?.wildlifeSightingId || !operation.file.wildlifePhotoId) {
+        const error = "The server uploaded the wildlife photo without returning its evidence ID.";
+        await markOperation(operation.ownerId, operation.module, {
+          ...operation, status: "FAILED", error,
+        });
+        if (operation.file?.wildlifeSightingId && operation.file.wildlifePhotoId) {
+          await saveRecord(updateWildlifePhotoUpload(
+            record,
+            operation.file.wildlifeSightingId,
+            operation.file.wildlifePhotoId,
+            "FAILED",
+            error,
+          ));
+          notifyOfflineQueueChanged();
+        }
+        return "failed";
+      }
+      const sightings: Array<Record<string, unknown>> = Array.isArray(record.payload.wildlife_sightings)
+        ? record.payload.wildlife_sightings as Array<Record<string, unknown>>
+        : [];
+      const updatedSightings = sightings.map((sighting) => {
+        if (sighting.sighting_id !== operation.file?.wildlifeSightingId || !Array.isArray(sighting.photos)) return sighting;
+        return {
+          ...sighting,
+          photos: (sighting.photos as Array<Record<string, unknown>>).map((photo) =>
+            photo.photo_id === operation.file?.wildlifePhotoId
+              ? { ...photo, evidence_id: evidenceId, upload_status: "UPLOADED", upload_error: null }
+              : photo,
+          ),
+        };
+      });
+      record = { ...record, payload: { ...record.payload, wildlife_sightings: updatedSightings }, syncError: null };
+      await saveRecord(record);
+      notifyOfflineQueueChanged();
+      await enqueueOfflineWildlifeIdentification(
+        operation.ownerId,
+        record,
+        evidenceId,
+        operation.file.wildlifeSightingId,
+        operation.file.wildlifePhotoId,
+      );
+      await completeOperation(operation, record, record.serverId);
+      return "ok";
+    }
+    if (response.success && operation.kind === "EVIDENCE_IDENTIFY") {
+      const result = response.data.identification;
+      const sightingId = operation.payload?.wildlifeSightingId;
+      const photoId = operation.payload?.wildlifePhotoId;
+      if (!result || typeof result !== "object" || typeof sightingId !== "string" || typeof photoId !== "string") {
+        await markOperation(operation.ownerId, operation.module, {
+          ...operation,
+          status: "FAILED",
+          retryable: false,
+          error: "The identification service did not return a persisted identification result.",
+        });
+        return "failed";
+      }
+      record = updateWildlifePhotoIdentification(record, sightingId, photoId, result as Record<string, unknown>);
+      await saveRecord(record);
+    }
     if (
       isIncidentUpdate &&
       method === "PUT" &&
@@ -488,19 +985,58 @@ async function syncOne(operation: Operation): Promise<"ok" | "auth" | "failed"> 
       await completeOperation(operation, record, serverId);
       return "ok";
     }
+    if (alreadyDeleted) {
+      await completeOperation(operation, record, record.serverId);
+      return "ok";
+    }
     const message = response.message || "The server did not accept the field form operation.";
     if (response.status === 401 || response.status === 403 || response.code === "AUTH_REQUIRED" || response.code === "FORBIDDEN") {
-      await markOperation(operation.ownerId, operation.module, { ...operation, status: "AUTH_REQUIRED", error: message });
+      await markOperation(operation.ownerId, operation.module, { ...operation, status: "AUTH_REQUIRED", retryable: false, error: message });
+      if (operation.kind === "EVIDENCE_UPLOAD" && operation.module === "PATROL_REPORT" &&
+        operation.file?.wildlifeSightingId && operation.file.wildlifePhotoId) {
+        record = updateWildlifePhotoUpload(
+          record,
+          operation.file.wildlifeSightingId,
+          operation.file.wildlifePhotoId,
+          "FAILED",
+          message,
+        );
+      }
       await saveRecord({ ...record, syncError: message });
+      notifyOfflineQueueChanged();
       return "auth";
     }
     const retryable = response.code === "NETWORK" || response.code === "TIMEOUT" ||
       response.code === "SERVER_ERROR" || (response.status !== undefined && response.status >= 500);
     if (!retryable || attempt === MAX_RETRIES) {
+      if (operation.kind === "EVIDENCE_UPLOAD" && operation.module === "PATROL_REPORT" &&
+        operation.file?.wildlifeSightingId && operation.file.wildlifePhotoId) {
+        record = updateWildlifePhotoUpload(
+          record,
+          operation.file.wildlifeSightingId,
+          operation.file.wildlifePhotoId,
+          "FAILED",
+          message,
+        );
+      }
+      if (operation.kind === "EVIDENCE_IDENTIFY") {
+        const sightingId = operation.payload?.wildlifeSightingId;
+        const photoId = operation.payload?.wildlifePhotoId;
+        if (typeof sightingId === "string" && typeof photoId === "string") {
+          record = updateWildlifePhotoIdentification(record, sightingId, photoId, {
+            status: "FAILED",
+            common_name: null,
+            scientific_name: null,
+            confidence: null,
+            error: message,
+          });
+        }
+      }
       await markOperation(operation.ownerId, operation.module, {
-        ...operation, status: "FAILED", attempts: attempt, error: message,
+        ...operation, status: "FAILED", attempts: attempt, retryable, error: message,
       });
       await saveRecord({ ...record, syncError: message });
+      notifyOfflineQueueChanged();
       return "failed";
     }
     await new Promise((resolve) => window.setTimeout(resolve, Math.min(1_000 * 2 ** attempt, 16_000)));
@@ -517,30 +1053,71 @@ export async function syncOfflineFieldFormQueue(
   if (typeof window === "undefined" || !navigator.onLine || !(await checkDiaryBackendReachable())) return "offline";
   const activeUser = getStoredUser();
   if (activeUser?.role !== "FIELD_OFFICER" || activeUser.id !== ownerId) return "auth_required";
-  const token = await acquireLock(ownerId, module);
+  let token = await acquireLock(ownerId, module);
   if (!token) return "busy";
   try {
-    const operations = await withStores([OPERATIONS], "readonly", async ({ [OPERATIONS]: store }) => {
-      const all = await requestValue(store.getAll()) as Operation[];
-      const owned = all.filter((item) => item?.ownerId === ownerId && item.module === module);
-      if (owned.some((item) =>
-        !item.id || !item.localId || !["CREATE", "UPDATE", "SUBMIT", "EVIDENCE_UPLOAD"].includes(item.kind) ||
-        !Number.isFinite(item.createdAt) || !Number.isFinite(item.revision) ||
-        !["PENDING", "SYNCING", "FAILED", "AUTH_REQUIRED"].includes(item.status)
-      )) throw new Error("A queued field operation is malformed and has been retained.");
-      return owned.sort((a, b) => a.createdAt - b.createdAt);
-    });
-    for (const operation of operations) {
-      if (operation.status === "AUTH_REQUIRED") return "auth_required";
-      if (operation.status === "FAILED") return "failed";
+    const processedOperationIds = new Set<string>();
+    const deferredOperationIds = new Set<string>();
+    while (true) {
+      const operation = await withStores([OPERATIONS], "readonly", async ({ [OPERATIONS]: store }) => {
+        const all = await requestValue(store.getAll()) as Operation[];
+        const owned = all.filter((item) => item?.ownerId === ownerId && item.module === module);
+        if (owned.some((item) =>
+          !item.id || !item.localId || !["CREATE", "UPDATE", "SUBMIT", "EVIDENCE_UPLOAD", "EVIDENCE_IDENTIFY", "EVIDENCE_DELETE"].includes(item.kind) ||
+          !Number.isFinite(item.createdAt) || !Number.isFinite(item.revision) ||
+          !["PENDING", "SYNCING", "FAILED", "AUTH_REQUIRED"].includes(item.status)
+        )) throw new Error("A queued field operation is malformed and has been retained.");
+        const savePriority = (candidate: Operation) =>
+          candidate.module === "PATROL_REPORT" &&
+          (candidate.kind === "CREATE" || candidate.kind === "UPDATE")
+            ? 0
+            : 1;
+        const selectable = owned
+          .filter((candidate) =>
+            !processedOperationIds.has(candidate.id) &&
+            !deferredOperationIds.has(candidate.id),
+          );
+        return selectable
+          .sort((a, b) =>
+            savePriority(a) - savePriority(b) || a.createdAt - b.createdAt,
+          )[0] ?? null;
+      });
+      if (!operation) {
+        const wakeRequested = await releaseLock(ownerId, module, token, true);
+        token = null;
+        if (wakeRequested) {
+          processedOperationIds.clear();
+          deferredOperationIds.clear();
+          token = await acquireLock(ownerId, module);
+          if (!token) return "busy";
+          continue;
+        }
+        if (deferredOperationIds.size) {
+          notifyOfflineQueueChanged();
+          return "busy";
+        }
+        break;
+      }
+      if (operation.status === "AUTH_REQUIRED" || operation.status === "FAILED") {
+        if (operation.status === "AUTH_REQUIRED") return "auth_required";
+        return "failed";
+      }
       const result = await syncOne(operation);
       if (result === "auth") return "auth_required";
       if (result === "failed") return "failed";
+      if (result === "deferred") {
+        deferredOperationIds.add(operation.id);
+        continue;
+      }
+      processedOperationIds.add(operation.id);
+      deferredOperationIds.clear();
     }
     notifyOfflineQueueChanged();
     return "synced";
   } finally {
-    await releaseLock(ownerId, module, token);
+    if (token && await releaseLock(ownerId, module, token, true)) {
+      notifyOfflineQueueChanged();
+    }
   }
 }
 
@@ -556,6 +1133,25 @@ async function retryFailed(ownerId: string, module: OfflineFieldModule): Promise
   });
 }
 
+async function retryTransientPatrolWildlifeOperations(ownerId: string): Promise<void> {
+  await withStores([OPERATIONS], "readwrite", async ({ [OPERATIONS]: store }) => {
+    const all = await requestValue(store.getAll()) as Operation[];
+    for (const item of all) {
+      if (item?.ownerId === ownerId && item.module === "PATROL_REPORT" &&
+        (item.kind === "EVIDENCE_UPLOAD" || item.kind === "EVIDENCE_IDENTIFY") &&
+        item.status === "FAILED" && item.retryable) {
+        await requestValue(store.put({
+          ...item,
+          status: "PENDING",
+          attempts: 0,
+          error: null,
+          retryable: undefined,
+        }));
+      }
+    }
+  });
+}
+
 export function useOfflineFieldForm(module: OfflineFieldModule) {
   const [ownerId, setOwnerId] = useState<string | null>(null);
   const [state, setState] = useState<FieldSyncState>("Offline");
@@ -563,6 +1159,7 @@ export function useOfflineFieldForm(module: OfflineFieldModule) {
   const [message, setMessage] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
   const syncingRef = useRef(false);
+  const pendingWakeRef = useRef(false);
   const authBlockedRef = useRef(false);
   const stateRef = useRef<FieldSyncState>("Offline");
   const updateState = useCallback((next: FieldSyncState) => {
@@ -597,7 +1194,11 @@ export function useOfflineFieldForm(module: OfflineFieldModule) {
   }, [module, ownerId, updateState]);
 
   const syncNow = useCallback(async (manual = false) => {
-    if (!ownerId || syncingRef.current || (!manual && authBlockedRef.current)) return;
+    if (!ownerId || (!manual && authBlockedRef.current)) return;
+    if (syncingRef.current) {
+      pendingWakeRef.current = true;
+      return;
+    }
     syncingRef.current = true;
     setSyncing(true);
     updateState("Syncing");
@@ -622,6 +1223,12 @@ export function useOfflineFieldForm(module: OfflineFieldModule) {
       syncingRef.current = false;
       setSyncing(false);
       await refreshCount();
+      if (pendingWakeRef.current) {
+        pendingWakeRef.current = false;
+        window.setTimeout(() => {
+          window.dispatchEvent(new Event("up-forest-offline-queue-changed"));
+        }, 0);
+      }
     }
   }, [module, ownerId, refreshCount, updateState]);
 
@@ -630,14 +1237,21 @@ export function useOfflineFieldForm(module: OfflineFieldModule) {
     authBlockedRef.current = false;
     void refreshCount();
     const reconnect = async () => {
-      if (!navigator.onLine || !(await checkDiaryBackendReachable())) { updateState("Offline"); return; }
+      if (!navigator.onLine || !(await checkDiaryBackendReachable())) {
+        updateState("Offline");
+        return;
+      }
+      if (module === "PATROL_REPORT") await retryTransientPatrolWildlifeOperations(ownerId);
       const count = await getPendingFieldOperationCount(ownerId, module);
       setPendingCount(count);
       if (!count) { updateState("Online"); return; }
       if (!authBlockedRef.current) { updateState("Pending Sync"); void syncNow(); }
       else updateState("Sync Failed");
     };
-    const onQueueChanged = () => void refreshCount();
+    const onQueueChanged = () => {
+      if (module === "PATROL_REPORT") void reconnect();
+      else void refreshCount();
+    };
     const onOffline = () => updateState("Offline");
     const onVisibility = () => { if (document.visibilityState === "visible") void reconnect(); };
     const channel = "BroadcastChannel" in window ? new BroadcastChannel("up-forest-field-offline") : null;

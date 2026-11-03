@@ -10,6 +10,7 @@ import {
   Printer,
   Users,
 } from "lucide-react";
+import type { WildlifeSighting } from "@/lib/patrol-wildlife";
 
 type SubmittedPatrolReport = {
   report_id: string;
@@ -39,6 +40,7 @@ type SubmittedPatrolReport = {
   purpose: string | null;
   observations: string | null;
   wildlife_sighting: string | null;
+  wildlife_sightings: WildlifeSighting[];
   illegal_activity: string | null;
   action_taken: string | null;
   incident_details: string | null;
@@ -583,4 +585,3 @@ export function SubmittedPatrolReport({
     </section>
   );
 }
-
