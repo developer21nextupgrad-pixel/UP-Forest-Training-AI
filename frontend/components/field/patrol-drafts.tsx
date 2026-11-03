@@ -14,10 +14,13 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { apiRequest } from "@/lib/api";
+import { getStoredUser } from "@/lib/auth";
+import { getOfflineFieldFormRecords } from "@/lib/offline-field-forms";
 import type { WildlifeSighting } from "@/lib/patrol-wildlife";
 
 type PatrolReport = {
   report_id: string;
+  local_record_id?: string;
   form_type: string;
   status: string;
 
@@ -74,22 +77,81 @@ export function PatrolDrafts({
     setIsLoading(true);
 
     try {
-      const result = await apiRequest<PatrolReportsResponse>(
-        "/api/v1/field/forms/patrol",
-      );
-
-      if (!result.success) {
-        throw new Error("Unable to load patrol reports.");
+      const owner = getStoredUser();
+      const localRecords = owner?.role === "FIELD_OFFICER"
+        ? await getOfflineFieldFormRecords(owner.id, "PATROL_REPORT")
+        : [];
+      let serverReports: PatrolReport[] = [];
+      let serverError: unknown;
+      try {
+        const result = await apiRequest<PatrolReportsResponse>(
+          "/api/v1/field/forms/patrol",
+        );
+        if (!result.success) throw new Error("Unable to load patrol reports.");
+        serverReports = result.reports || [];
+      } catch (error) {
+        serverError = error;
       }
 
-      setReports(result.reports || []);
+      const localByServerId = new Map(
+        localRecords.filter((record) => record.serverId)
+          .map((record) => [record.serverId!, record]),
+      );
+      const reportsById = new Map<string, PatrolReport>();
+      for (const report of serverReports) {
+        const local = localByServerId.get(report.report_id);
+        reportsById.set(report.report_id, local
+          ? {
+              ...report,
+              ...local.payload,
+              report_id: report.report_id,
+              local_record_id: local.localId,
+              status: report.status === "SUBMITTED" ? report.status : local.status,
+              created_at: report.created_at,
+              updated_at: local.updatedAt,
+              submitted_at: report.submitted_at,
+            } as PatrolReport
+          : report);
+      }
+      for (const local of localRecords) {
+        if (local.serverId && reportsById.has(local.serverId)) continue;
+        const payload = local.payload;
+        reportsById.set(local.serverId ?? `local:${local.localId}`, {
+          report_id: local.serverId ?? local.localId,
+          local_record_id: local.localId,
+          form_type: "PATROL",
+          status: local.status,
+          patrol_date: (payload.patrol_date as string | null) ?? null,
+          beat: (payload.beat as string | null) ?? null,
+          range_name: (payload.range_name as string | null) ?? null,
+          division: (payload.division as string | null) ?? null,
+          start_time: (payload.start_time as string | null) ?? null,
+          end_time: (payload.end_time as string | null) ?? null,
+          location: (payload.location as string | null) ?? null,
+          team_members: Array.isArray(payload.team_members) ? payload.team_members as string[] : [],
+          purpose: (payload.purpose as string | null) ?? null,
+          observations: (payload.observations as string | null) ?? null,
+          wildlife_sighting: (payload.wildlife_sighting as string | null) ?? null,
+          wildlife_sightings: Array.isArray(payload.wildlife_sightings)
+            ? payload.wildlife_sightings as WildlifeSighting[]
+            : [],
+          illegal_activity: (payload.illegal_activity as string | null) ?? null,
+          action_taken: (payload.action_taken as string | null) ?? null,
+          incident_details: (payload.incident_details as string | null) ?? null,
+          additional_remarks: (payload.additional_remarks as string | null) ?? null,
+          source_text: (payload.source_text as string | null) ?? null,
+          ai_confidence: (payload.ai_confidence as number | null) ?? null,
+          created_at: local.updatedAt,
+          updated_at: local.updatedAt,
+          submitted_at: null,
+        });
+      }
+      setReports([...reportsById.values()]);
+      if (serverError && !localRecords.length) {
+        toast.error(serverError instanceof Error ? serverError.message : "Unable to load patrol reports.");
+      }
     } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : "Unable to load patrol reports.";
-
-      toast.error(message);
+      toast.error(error instanceof Error ? error.message : "Unable to load patrol reports.");
     } finally {
       setIsLoading(false);
     }
@@ -100,7 +162,7 @@ export function PatrolDrafts({
 }, [loadReports, refreshKey]);
 
   const draftReports = useMemo(
-    () => reports.filter((report) => report.status === "DRAFT"),
+    () => reports.filter((report) => report.status !== "SUBMITTED"),
     [reports],
   );
 
@@ -375,7 +437,7 @@ export function PatrolDrafts({
               disabled={!onOpenDraft}
               className="w-full rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              Open Draft
+              Open / Edit
             </button>
           )}
         </div>

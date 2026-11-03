@@ -110,4 +110,18 @@ describe("apiRequest authentication", () => {
     expect(calls.filter((url) => url.endsWith("/api/v1/field/forms/patrol"))).toHaveLength(2);
     expect(calls.filter((url) => url.endsWith("/api/v1/auth/refresh"))).toHaveLength(1);
   });
+
+  it("preserves FastAPI detail messages and response status for offline sync errors", async () => {
+    globalThis.fetch = vi.fn(async () => new Response(
+      JSON.stringify({ detail: "The Patrol Report is missing a wildlife photo." }),
+      { status: 422, headers: { "Content-Type": "application/json" } },
+    ));
+
+    await expect(apiRequest("/api/v1/field/forms/patrol/patrol-id", { method: "PUT" }))
+      .resolves.toMatchObject({
+        success: false,
+        status: 422,
+        message: "The Patrol Report is missing a wildlife photo.",
+      });
+  });
 });

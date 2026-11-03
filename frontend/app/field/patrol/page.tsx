@@ -7,6 +7,7 @@ import {
   MessageSquareText,
   Mic,
   MicOff,
+  Plus,
   Send,
   ShieldCheck,
   Square,
@@ -51,6 +52,7 @@ type ReviewStatus =
 
 type PatrolReportDraft = {
   report_id: string;
+  local_record_id?: string;
   form_type: string;
   status: string;
 
@@ -326,7 +328,8 @@ export default function FieldOfficerPage() {
 
   const [showPatrolForm, setShowPatrolForm] =
     React.useState(true);
-  
+  const [formSessionKey, setFormSessionKey] = React.useState("initial");
+  const [startBlankReport, setStartBlankReport] = React.useState(false);
   const [patrolDraftRefreshKey, setPatrolDraftRefreshKey] = React.useState(0);
 
   const [
@@ -510,8 +513,39 @@ export default function FieldOfficerPage() {
     toast.success("Patrol draft saved successfully.");
   }, []);
 
+  const startNewPatrolReport = () => {
+    setSelectedDraft(null);
+    setStartBlankReport(true);
+    setFormSessionKey(`new:${Date.now()}:${Math.random()}`);
+    setShowPatrolForm(true);
+    window.setTimeout(() => {
+      document.getElementById("patrol-report-form")?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    }, 50);
+  };
+
   return (
-    <main className="min-h-[calc(100vh-64px)] bg-background text-foreground">
+    <main className="min-h-[calc(100vh-64px)] bg-background px-4 py-6 text-foreground md:px-6">
+      <div className="mx-auto max-w-7xl space-y-6">
+        <header className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-border bg-card p-5 shadow-sm">
+          <div>
+            <p className="text-sm font-medium text-emerald-700 dark:text-emerald-400">Field Officer · Patrol</p>
+            <h1 className="mt-1 text-2xl font-bold tracking-tight">Patrol Reports</h1>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Create a report, continue a draft, or review submitted patrols.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={startNewPatrolReport}
+            className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2"
+          >
+            <Plus className="h-4 w-4" />
+            New Patrol Report
+          </button>
+        </header>
 
             {/* Submitted Patrol Report Viewer */}
       {selectedSubmittedReport && (
@@ -534,10 +568,14 @@ export default function FieldOfficerPage() {
       {/* Patrol Report Form */}
       {showPatrolForm && (
         <PatrolReportForm
+          key={formSessionKey}
           initialDraft={selectedDraft}
+          initialLocalId={selectedDraft?.local_record_id}
+          startBlank={startBlankReport}
           onSaved={handleDraftSaved}
           onClose={() => {
             setSelectedDraft(null);
+            setStartBlankReport(false);
             setShowPatrolForm(false);
           }}
         />
@@ -548,11 +586,13 @@ export default function FieldOfficerPage() {
         refreshKey={patrolDraftRefreshKey}
         onOpenDraft={(draft) => {
           setSelectedDraft(draft);
+          setStartBlankReport(false);
+          setFormSessionKey(`draft:${draft.local_record_id ?? draft.report_id}`);
           setShowPatrolForm(true);
 
           window.setTimeout(() => {
             document
-              .getElementById("submitted-patrol-report")
+              .getElementById("patrol-report-form")
               ?.scrollIntoView({
                 behavior: "smooth",
                 block: "start",
@@ -573,6 +613,7 @@ export default function FieldOfficerPage() {
           }, 50);
         }}
       />
+      </div>
     </main>
   );
 }

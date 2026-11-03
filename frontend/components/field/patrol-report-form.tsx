@@ -23,7 +23,6 @@ import { apiRequest, apiUrl } from "@/lib/api";
 import { getAccessToken } from "@/lib/auth";
 import {
     createFieldLocalId,
-    cancelOfflineEvidenceUpload,
     enqueueOfflineEvidenceDelete,
     enqueueOfflineEvidenceUpload,
     enqueueOfflineWildlifeIdentification,
@@ -33,7 +32,9 @@ import {
     getOfflineFormRecord,
     loadOfflineFormDraft,
     markOfflineFieldFormSubmitted,
-    persistPatrolMetadataBeforeWildlifeEvidence,
+    persistOfflineFieldRecord,
+    removeOfflineWildlifePhoto,
+    removeOfflineWildlifeSighting,
     saveOfflineFormDraft,
     useOfflineFieldForm,
     type OfflineFieldRecord,
@@ -41,9 +42,10 @@ import {
 import {
     captureWildlifeLocation,
     compressWildlifeImage,
+    createWildlifePhoto,
     createWildlifeSighting,
+    mergeWildlifeSightings,
     type WildlifePhoto,
-    type WildlifeLocation,
     type WildlifeSighting,
 } from "@/lib/patrol-wildlife";
 import { OfflineFieldFormControls } from "./offline-field-form-controls";
@@ -99,6 +101,7 @@ type PatrolReportSubmitResponse = {
 
 type PatrolReportDraft = PatrolReportFields & {
     report_id: string;
+    local_record_id?: string;
     form_type: string;
     status: string;
     source_text: string | null;
@@ -152,27 +155,11 @@ function serializableWildlifeSightings(sightings: WildlifeSighting[]) {
     }));
 }
 
-function mergeWildlifeSightings(
-    current: WildlifeSighting[],
-    incoming: WildlifeSighting[],
-): WildlifeSighting[] {
-    const currentById = new Map(current.map((sighting) => [sighting.sighting_id, sighting]));
-    return incoming.map((sighting) => {
-        const existing = currentById.get(sighting.sighting_id);
-        const photos = new Map((existing?.photos ?? []).map((photo) => [photo.photo_id, photo]));
-        return {
-            ...sighting,
-            photos: sighting.photos.map((photo) => ({
-                ...photo,
-                file: photo.file ?? photos.get(photo.photo_id)?.file,
-            })),
-        };
-    });
-}
-
 type Props = {
     onClose?: () => void;
     initialDraft?: PatrolReportDraft | null;
+    initialLocalId?: string;
+    startBlank?: boolean;
     onSaved?: () => void;
 };
 
@@ -227,15 +214,21 @@ const REQUIRED_SUBMIT_FIELDS = [
 export function PatrolReportForm({
     onClose,
     initialDraft,
+    initialLocalId,
+    startBlank = false,
     onSaved,
 }: Props) {
     const offline = useOfflineFieldForm("PATROL_REPORT");
-    const localId = useRef("");
+    const localId = useRef(initialLocalId ?? initialDraft?.report_id ?? createFieldLocalId());
+    const reportSaveRequested = useRef(Boolean(initialDraft || initialLocalId));
     const previousOwnerId = useRef<string | null>(null);
     const [description, setDescription] = useState("");
 
     const [fields, setFields] =
         useState<PatrolReportFields>(EMPTY_FIELDS);
+    const fieldsRef = useRef(fields);
+    fieldsRef.current = fields;
+    const localPersistChain = useRef<Promise<void>>(Promise.resolve());
 
     const [photoTarget, setPhotoTarget] = useState<{ sightingId: string; photoId?: string } | null>(null);
     const cameraInputRef = useRef<HTMLInputElement>(null);
@@ -263,8 +256,8 @@ export function PatrolReportForm({
     const [offlineDraftRestored, setOfflineDraftRestored] = useState(false);
 
     useEffect(() => {
-        if (!localId.current) localId.current = initialDraft?.report_id ?? createFieldLocalId();
-    }, [initialDraft]);
+        if (!localId.current) localId.current = initialLocalId ?? initialDraft?.report_id ?? createFieldLocalId();
+    }, [initialDraft, initialLocalId]);
 
     useEffect(() => {
         if (previousOwnerId.current !== offline.ownerId) {
@@ -284,8 +277,27 @@ export function PatrolReportForm({
         }
         setOfflineDraftRestored(false);
         if (!offline.ownerId) return;
+        if (startBlank) {
+            setOfflineDraftRestored(true);
+            return;
+        }
         let cancelled = false;
-        void loadOfflineFormDraft<Record<string, unknown>>(offline.ownerId, "PATROL_REPORT", "active")
+        const selectedLocalId = initialLocalId ?? initialDraft?.report_id;
+        const selectedDraftKey = selectedLocalId ? `patrol:${selectedLocalId}` : "active";
+        void loadOfflineFormDraft<Record<string, unknown>>(
+            offline.ownerId,
+            "PATROL_REPORT",
+            selectedDraftKey,
+        )
+            .then(async (draft) => {
+                if (draft || selectedDraftKey === "active") return draft;
+                const active = await loadOfflineFormDraft<Record<string, unknown>>(
+                    offline.ownerId!,
+                    "PATROL_REPORT",
+                    "active",
+                );
+                return active?.snapshot.localId === selectedLocalId ? active : undefined;
+            })
             .then(async (draft) => {
                 if (cancelled || !draft) return;
                 const snapshot = draft.snapshot;
@@ -297,7 +309,13 @@ export function PatrolReportForm({
                         snapshot.localId,
                     );
                 }
+                if (
+                    selectedLocalId &&
+                    typeof snapshot.localId === "string" &&
+                    snapshot.localId !== selectedLocalId
+                ) return;
                 if (initialDraft &&
+                    !selectedLocalId &&
                     matchingRecord?.serverId !== initialDraft.report_id &&
                     snapshot.reportId !== initialDraft.report_id &&
                     snapshot.savedReportId !== initialDraft.report_id) {
@@ -310,10 +328,14 @@ export function PatrolReportForm({
                         ...previous,
                         ...storedFields,
                         wildlife_sightings: mergeWildlifeSightings(
-                            previous.wildlife_sightings,
+                            Array.isArray(matchingRecord?.payload.wildlife_sightings)
+                                ? matchingRecord.payload.wildlife_sightings as WildlifeSighting[]
+                                : previous.wildlife_sightings,
                             Array.isArray(storedFields.wildlife_sightings)
                                 ? storedFields.wildlife_sightings
                                 : [],
+                            new Set(matchingRecord?.deletedWildlifePhotoIds ?? []),
+                            new Set(matchingRecord?.deletedWildlifeSightingIds ?? []),
                         ),
                     }));
                 }
@@ -322,17 +344,17 @@ export function PatrolReportForm({
                 setIsExtracted(snapshot.isExtracted === true);
                 if (!initialDraft && typeof snapshot.reportId === "string") setReportId(snapshot.reportId);
                 if (!initialDraft && typeof snapshot.savedReportId === "string") setSavedReportId(snapshot.savedReportId);
-                if (!initialDraft && snapshot.queuedCreate === true) setQueuedCreate(true);
+                if ((!initialDraft || selectedLocalId) && snapshot.queuedCreate === true) setQueuedCreate(true);
                 toast.info("Restored your locally saved patrol report draft.");
             })
             .catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Unable to restore the local patrol draft."))
             .finally(() => { if (!cancelled) setOfflineDraftRestored(true); });
         return () => { cancelled = true; };
-    }, [initialDraft, offline.ownerId]);
+    }, [initialDraft, initialLocalId, offline.ownerId, startBlank]);
 
     useEffect(() => {
         if (!offline.ownerId || !offlineDraftRestored || !localId.current || isSubmitted) return;
-        void saveOfflineFormDraft(offline.ownerId, "PATROL_REPORT", "active", {
+        const snapshot = {
             localId: localId.current,
             fields: fields as unknown as Record<string, unknown>,
             description,
@@ -341,7 +363,11 @@ export function PatrolReportForm({
             reportId,
             savedReportId,
             queuedCreate,
-        }).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Unable to save the local patrol draft."));
+        };
+        void Promise.all([
+            saveOfflineFormDraft(offline.ownerId, "PATROL_REPORT", "active", snapshot),
+            saveOfflineFormDraft(offline.ownerId, "PATROL_REPORT", `patrol:${localId.current}`, snapshot),
+        ]).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Unable to save the local patrol draft."));
     }, [confidence, description, fields, isExtracted, isSubmitted, offline.ownerId, offlineDraftRestored, queuedCreate, reportId, savedReportId]);
 
     useEffect(() => {
@@ -361,6 +387,8 @@ export function PatrolReportForm({
                             wildlife_sightings: mergeWildlifeSightings(
                                 previous.wildlife_sightings,
                                 record.payload.wildlife_sightings as WildlifeSighting[],
+                                new Set(record.deletedWildlifePhotoIds ?? []),
+                                new Set(record.deletedWildlifeSightingIds ?? []),
                             ),
                         }));
                     }
@@ -407,13 +435,14 @@ export function PatrolReportForm({
         setMissingFields([]);
         setConfidence(initialDraft.ai_confidence);
 
-        setReportId(initialDraft.report_id);
-        setSavedReportId(initialDraft.report_id);
-        localId.current = initialDraft.report_id;
+        const isLocalOnlyDraft = initialLocalId === initialDraft.report_id;
+        setReportId(isLocalOnlyDraft ? null : initialDraft.report_id);
+        setSavedReportId(isLocalOnlyDraft ? null : initialDraft.report_id);
+        localId.current = initialLocalId ?? initialDraft.report_id;
 
         setIsExtracted(true);
         setIsSubmitted(initialDraft.status === "SUBMITTED");
-    }, [initialDraft]);
+    }, [initialDraft, initialLocalId]);
 
     const updateField = <K extends keyof PatrolReportFields>(
         key: K,
@@ -461,17 +490,141 @@ export function PatrolReportForm({
         }
     };
 
+    const persistPatrolLocalState = (
+        requestedFields: PatrolReportFields = fieldsRef.current,
+    ): Promise<OfflineFieldRecord | null> => {
+        if (!offline.ownerId) return Promise.resolve(null);
+        const ownerId = offline.ownerId;
+        const task = localPersistChain.current.catch(() => undefined).then(async () => {
+            const draftLocalId = localId.current || (localId.current = createFieldLocalId());
+            const latest = await getOfflineFormRecord(ownerId, "PATROL_REPORT", draftLocalId);
+            const currentFields = fieldsRef.current;
+            const deletedPhotos = new Set(latest?.deletedWildlifePhotoIds ?? []);
+            const deletedSightings = new Set(latest?.deletedWildlifeSightingIds ?? []);
+            const mergedFields: PatrolReportFields = {
+                ...requestedFields,
+                ...currentFields,
+                wildlife_sightings: mergeWildlifeSightings(
+                    requestedFields.wildlife_sightings,
+                    currentFields.wildlife_sightings,
+                    deletedPhotos,
+                    deletedSightings,
+                ),
+            };
+            const payload = {
+                ...mergedFields,
+                wildlife_sightings: serializableWildlifeSightings(mergedFields.wildlife_sightings),
+                team_members: mergedFields.team_members.map((member) => member.trim()).filter(Boolean),
+                source_text: description.trim() || null,
+                ai_confidence: confidence,
+            };
+            const snapshot = {
+                localId: draftLocalId,
+                fields: mergedFields as unknown as Record<string, unknown>,
+                description,
+                confidence,
+                isExtracted,
+                reportId: latest?.serverId ?? reportId,
+                savedReportId: latest?.serverId ?? savedReportId,
+                queuedCreate,
+            };
+            const persisted = await persistOfflineFieldRecord(ownerId, {
+                ownerId,
+                module: "PATROL_REPORT",
+                localId: draftLocalId,
+                serverId: latest?.serverId ?? reportId,
+                payload,
+                status: latest?.status ?? (isSubmitted ? "SUBMITTED" : "DRAFT"),
+                syncError: latest?.syncError ?? null,
+                updatedAt: new Date().toISOString(),
+                deletedWildlifePhotoIds: latest?.deletedWildlifePhotoIds,
+                deletedWildlifeSightingIds: latest?.deletedWildlifeSightingIds,
+            });
+            await Promise.all([
+                saveOfflineFormDraft(ownerId, "PATROL_REPORT", "active", snapshot),
+                saveOfflineFormDraft(ownerId, "PATROL_REPORT", `patrol:${draftLocalId}`, snapshot),
+            ]);
+            return persisted;
+        });
+        localPersistChain.current = task.then(() => undefined, () => undefined);
+        return task;
+    };
+
+    const enqueueSavedPatrolMetadata = async () => {
+        if (!offline.ownerId || !reportSaveRequested.current) return;
+        const latest = await getOfflineFormRecord(offline.ownerId, "PATROL_REPORT", localId.current);
+        if (!latest || latest.status === "SUBMITTED") return;
+        await enqueueOfflineFieldOperation(
+            offline.ownerId,
+            "PATROL_REPORT",
+            latest,
+            latest.serverId ? "UPDATE" : "CREATE",
+        );
+        if (!latest.serverId) setQueuedCreate(true);
+    };
+
     const addWildlifeSighting = async () => {
-        let location: WildlifeLocation | undefined;
+        if (!offline.ownerId) {
+            toast.error("Sign in as a field officer to save wildlife sightings locally.");
+            return;
+        }
+        const sighting = createWildlifeSighting();
+        const currentFields = fieldsRef.current;
+        const nextFields = {
+            ...currentFields,
+            wildlife_sightings: [...currentFields.wildlife_sightings, sighting],
+        };
+        fieldsRef.current = nextFields;
+        setFields(nextFields);
+        try {
+            await persistPatrolLocalState(nextFields);
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : "Unable to save the wildlife sighting locally.");
+            return;
+        }
+
+        let location: Awaited<ReturnType<typeof captureWildlifeLocation>>;
         try {
             location = await captureWildlifeLocation();
         } catch (error) {
+            const latestFields = fieldsRef.current;
+            const updatedFields = {
+                ...latestFields,
+                wildlife_sightings: latestFields.wildlife_sightings.map((item) =>
+                    item.sighting_id === sighting.sighting_id &&
+                    (item.latitude === null || item.longitude === null)
+                        ? { ...item, location_capture_status: "UNAVAILABLE" as const }
+                        : item,
+                ),
+            };
+            fieldsRef.current = updatedFields;
+            setFields(updatedFields);
+            await persistPatrolLocalState(updatedFields).catch((persistError: unknown) =>
+                toast.error(persistError instanceof Error ? persistError.message : "Unable to save location status locally."),
+            );
             toast.info(error instanceof Error ? error.message : "Location is unavailable. You can enter coordinates manually.");
+            return;
         }
-        setFields((previous) => ({
-            ...previous,
-            wildlife_sightings: [...previous.wildlife_sightings, createWildlifeSighting(location)],
-        }));
+        const latestFields = fieldsRef.current;
+        const updatedFields = {
+            ...latestFields,
+            wildlife_sightings: latestFields.wildlife_sightings.map((item) =>
+                item.sighting_id === sighting.sighting_id
+                    ? item.latitude === null && item.longitude === null &&
+                        item.location_capture_status === "NOT_CAPTURED"
+                        ? { ...item, ...location }
+                        : item
+                    : item,
+            ),
+        };
+        fieldsRef.current = updatedFields;
+        setFields(updatedFields);
+        try {
+            await persistPatrolLocalState(updatedFields);
+            await enqueueSavedPatrolMetadata();
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : "Unable to save the GPS location locally.");
+        }
     };
 
     const getStoredEvidenceId = async (
@@ -495,10 +648,11 @@ export function PatrolReportForm({
     };
 
     const removeWildlifePhoto = async (sightingId: string, photoId: string) => {
-        const sighting = fields.wildlife_sightings.find((item) => item.sighting_id === sightingId);
+        const currentFields = fieldsRef.current;
+        const sighting = currentFields.wildlife_sightings.find((item) => item.sighting_id === sightingId);
         const photo = sighting?.photos.find((item) => item.photo_id === photoId);
         if (!sighting || !photo) return;
-        const nextSightings = fields.wildlife_sightings.map((item) =>
+        const nextSightings = currentFields.wildlife_sightings.map((item) =>
             item.sighting_id === sightingId
                 ? { ...item, photos: item.photos.filter((itemPhoto) => itemPhoto.photo_id !== photoId) }
                 : item,
@@ -512,26 +666,32 @@ export function PatrolReportForm({
                     localId: localId.current,
                     serverId: reportId,
                     payload: {
-                        ...fields,
+                        ...currentFields,
                         wildlife_sightings: serializableWildlifeSightings(nextSightings),
                     },
                     status: "DRAFT",
                     syncError: null,
                     updatedAt: new Date().toISOString(),
                 };
+                await removeOfflineWildlifePhoto(
+                    offline.ownerId,
+                    localId.current,
+                    sightingId,
+                    photoId,
+                );
+                const latestRecord = await getOfflineFormRecord(
+                    offline.ownerId,
+                    "PATROL_REPORT",
+                    localId.current,
+                );
                 if (evidenceId) {
-                    await enqueueOfflineEvidenceDelete(offline.ownerId, record, evidenceId);
-                } else if (photo.file) {
-                    await cancelOfflineEvidenceUpload(
-                        offline.ownerId,
-                        "PATROL_REPORT",
-                        localId.current,
-                        `wildlife:${sightingId}:${photoId}`,
-                    );
+                    await enqueueOfflineEvidenceDelete(offline.ownerId, latestRecord ?? record, evidenceId);
+                }
+                if (latestRecord?.status !== "SUBMITTED") {
                     await enqueueOfflineFieldOperation(
                         offline.ownerId,
                         "PATROL_REPORT",
-                        record,
+                        latestRecord ?? record,
                         reportId ? "UPDATE" : "CREATE",
                     );
                 }
@@ -540,16 +700,16 @@ export function PatrolReportForm({
             toast.error(error instanceof Error ? error.message : "Unable to remove the wildlife photo.");
             return;
         }
-        setFields((previous) => ({
-            ...previous,
-            wildlife_sightings: nextSightings,
-        }));
+        const nextFields = { ...currentFields, wildlife_sightings: nextSightings };
+        fieldsRef.current = nextFields;
+        setFields(nextFields);
     };
 
     const removeWildlifeSighting = async (sightingId: string) => {
-        const sighting = fields.wildlife_sightings.find((item) => item.sighting_id === sightingId);
+        const currentFields = fieldsRef.current;
+        const sighting = currentFields.wildlife_sightings.find((item) => item.sighting_id === sightingId);
         if (!sighting) return;
-        const nextSightings = fields.wildlife_sightings.filter(
+        const nextSightings = currentFields.wildlife_sightings.filter(
             (item) => item.sighting_id !== sightingId,
         );
         try {
@@ -560,13 +720,14 @@ export function PatrolReportForm({
                     localId: localId.current,
                     serverId: reportId,
                     payload: {
-                        ...fields,
+                        ...currentFields,
                         wildlife_sightings: serializableWildlifeSightings(nextSightings),
                     },
                     status: "DRAFT",
                     syncError: null,
                     updatedAt: new Date().toISOString(),
                 };
+                const evidenceIds: string[] = [];
                 for (const photo of sighting.photos) {
                     const evidenceId = await getStoredEvidenceId(
                         sightingId,
@@ -574,158 +735,284 @@ export function PatrolReportForm({
                         photo.evidence_id,
                     );
                     if (evidenceId) {
-                        await enqueueOfflineEvidenceDelete(offline.ownerId, record, evidenceId);
-                    } else if (photo.file) {
-                        await cancelOfflineEvidenceUpload(
-                            offline.ownerId,
-                            "PATROL_REPORT",
-                            localId.current,
-                            `wildlife:${sightingId}:${photo.photo_id}`,
-                        );
-                        await enqueueOfflineFieldOperation(
-                            offline.ownerId,
-                            "PATROL_REPORT",
-                            record,
-                            reportId ? "UPDATE" : "CREATE",
-                        );
+                        evidenceIds.push(evidenceId);
                     }
+                }
+                await removeOfflineWildlifeSighting(
+                    offline.ownerId,
+                    localId.current,
+                    sightingId,
+                );
+                const latestRecord = await getOfflineFormRecord(
+                    offline.ownerId,
+                    "PATROL_REPORT",
+                    localId.current,
+                );
+                for (const evidenceId of evidenceIds) {
+                    await enqueueOfflineEvidenceDelete(offline.ownerId, latestRecord ?? record, evidenceId);
+                }
+                if (latestRecord?.status !== "SUBMITTED") {
+                    await enqueueOfflineFieldOperation(
+                        offline.ownerId,
+                        "PATROL_REPORT",
+                        latestRecord ?? record,
+                        reportId ? "UPDATE" : "CREATE",
+                    );
                 }
             }
         } catch (error) {
             toast.error(error instanceof Error ? error.message : "Unable to remove the wildlife sighting.");
             return;
         }
-        setFields((previous) => ({
-            ...previous,
-            wildlife_sightings: nextSightings,
-        }));
+        const nextFields = { ...currentFields, wildlife_sightings: nextSightings };
+        fieldsRef.current = nextFields;
+        setFields(nextFields);
     };
 
     const captureSightingLocation = async (sightingId: string) => {
+        if (!offline.ownerId) {
+            toast.error("Sign in as a field officer to save wildlife locations locally.");
+            return;
+        }
+        const startingSighting = fieldsRef.current.wildlife_sightings
+            .find((sighting) => sighting.sighting_id === sightingId);
+        if (!startingSighting) {
+            toast.error("The wildlife sighting is no longer available.");
+            return;
+        }
+        let location: Awaited<ReturnType<typeof captureWildlifeLocation>>;
         try {
-            const location = await captureWildlifeLocation();
-            setFields((previous) => ({
+            location = await captureWildlifeLocation();
+        } catch (error) {
+            const previous = fieldsRef.current;
+            const nextFields = {
                 ...previous,
                 wildlife_sightings: previous.wildlife_sightings.map((sighting) =>
-                    sighting.sighting_id === sightingId
-                        ? { ...sighting, ...location }
+                    sighting.sighting_id === sightingId &&
+                    (sighting.latitude === null || sighting.longitude === null)
+                        ? { ...sighting, location_capture_status: "UNAVAILABLE" as const }
                         : sighting,
                 ),
-            }));
-            toast.success("Current location captured.");
-        } catch (error) {
+            };
+            fieldsRef.current = nextFields;
+            setFields(nextFields);
+            await persistPatrolLocalState(nextFields).catch((persistError: unknown) =>
+                toast.error(persistError instanceof Error ? persistError.message : "Unable to save location status locally."),
+            );
             toast.error(error instanceof Error ? error.message : "Unable to capture current location.");
+            return;
+        }
+        const previous = fieldsRef.current;
+        const nextFields = {
+            ...previous,
+            wildlife_sightings: previous.wildlife_sightings.map((sighting) =>
+                sighting.sighting_id === sightingId
+                    ? sighting.latitude === startingSighting.latitude &&
+                        sighting.longitude === startingSighting.longitude &&
+                        sighting.accuracy_m === startingSighting.accuracy_m &&
+                        sighting.captured_at === startingSighting.captured_at
+                        ? { ...sighting, ...location }
+                        : sighting
+                    : sighting,
+            ),
+        };
+        fieldsRef.current = nextFields;
+        setFields(nextFields);
+        try {
+            await persistPatrolLocalState(nextFields);
+            await enqueueSavedPatrolMetadata();
+            toast.success("GPS location saved locally.");
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : "Unable to save the GPS location locally.");
         }
     };
 
     const handleWildlifePhotoSelection = async (selectedFiles: FileList | null) => {
         if (!selectedFiles || !photoTarget) return;
+        if (!offline.ownerId) {
+            toast.error("Sign in as a field officer to save wildlife photos locally.");
+            return;
+        }
         const target = photoTarget;
         setPhotoTarget(null);
         const prepared: WildlifePhoto[] = [];
         for (const file of Array.from(selectedFiles)) {
             try {
                 const compressed = await compressWildlifeImage(file);
-                prepared.push({
-                    photo_id: crypto.randomUUID(),
-                    file_name: compressed.name,
-                    mime_type: compressed.type,
-                    file_size: compressed.size,
-                    evidence_id: null,
-                    identification: {
-                        status: "PENDING",
-                        common_name: null,
-                        scientific_name: null,
-                        confidence: null,
-                    },
-                    file: compressed,
-                });
+                const currentSighting = fieldsRef.current.wildlife_sightings
+                    .find((item) => item.sighting_id === target.sightingId);
+                if (!currentSighting) {
+                    toast.error("The selected wildlife sighting is no longer available.");
+                    continue;
+                }
+                prepared.push(createWildlifePhoto(compressed, currentSighting));
             } catch (error) {
                 toast.error(error instanceof Error ? error.message : "Unable to process the selected wildlife photo.");
             }
         }
         if (!prepared.length) return;
         if (target.photoId) await removeWildlifePhoto(target.sightingId, target.photoId);
-        const nextSightings = fields.wildlife_sightings.map((sighting) => {
-            if (sighting.sighting_id !== target.sightingId) return sighting;
-            return { ...sighting, photos: [...sighting.photos, ...prepared] };
-        });
-        setFields((previous) => ({
-            ...previous,
-            wildlife_sightings: previous.wildlife_sightings.map((sighting) => {
+        const currentFields = fieldsRef.current;
+        const nextFields = {
+            ...currentFields,
+            wildlife_sightings: currentFields.wildlife_sightings.map((sighting) => {
                 if (sighting.sighting_id !== target.sightingId) return sighting;
                 return { ...sighting, photos: [...sighting.photos, ...prepared] };
             }),
-        }));
+        };
+        fieldsRef.current = nextFields;
+        setFields(nextFields);
 
-        // Start the normal offline queue as soon as the photo is selected.
-        // Pass the new snapshot explicitly because React state updates are async.
         if (offline.ownerId) {
             const record: OfflineFieldRecord = {
                 ownerId: offline.ownerId,
                 module: "PATROL_REPORT",
-                localId: localId.current || (localId.current = createFieldLocalId()),
+                localId: localId.current,
                 serverId: reportId,
                 payload: {
-                    ...fields,
-                    wildlife_sightings: nextSightings,
+                    ...nextFields,
+                    wildlife_sightings: serializableWildlifeSightings(nextFields.wildlife_sightings),
                 },
                 status: "DRAFT",
                 syncError: null,
                 updatedAt: new Date().toISOString(),
             };
-            void queueWildlifePhotos(record, false, nextSightings).catch((error: unknown) => {
+            try {
+                await persistPatrolLocalState(nextFields);
+                await queueWildlifePhotos(record);
+            } catch (error) {
                 toast.error(error instanceof Error
-                    ? error.message
-                    : "Unable to queue the wildlife photo for upload.");
-            });
+                    ? `Wildlife photo is visible but could not be saved locally: ${error.message}`
+                    : "Wildlife photo is visible but could not be saved locally.");
+            }
         }
     };
 
     const updateSighting = (sightingId: string, update: Partial<WildlifeSighting>) => {
-        setFields((previous) => ({
+        const previous = fieldsRef.current;
+        const nextFields: PatrolReportFields = {
             ...previous,
             wildlife_sightings: previous.wildlife_sightings.map((sighting) =>
-                sighting.sighting_id === sightingId ? { ...sighting, ...update } : sighting,
+                sighting.sighting_id === sightingId
+                    ? (() => {
+                        const updated = { ...sighting, ...update };
+                        const validCoordinates = Number.isFinite(updated.latitude) &&
+                            updated.latitude !== null && updated.latitude >= -90 && updated.latitude <= 90 &&
+                            Number.isFinite(updated.longitude) &&
+                            updated.longitude !== null && updated.longitude >= -180 && updated.longitude <= 180;
+                        return validCoordinates && (
+                            Object.hasOwn(update, "latitude") || Object.hasOwn(update, "longitude")
+                        )
+                            ? {
+                                ...updated,
+                                captured_at: new Date().toISOString(),
+                                location_capture_status: "MANUAL" as const,
+                            }
+                            : updated;
+                    })()
+                    : sighting,
             ),
-        }));
+        };
+        fieldsRef.current = nextFields;
+        setFields(nextFields);
+        if (
+            Object.prototype.hasOwnProperty.call(update, "latitude") ||
+            Object.prototype.hasOwnProperty.call(update, "longitude") ||
+            Object.prototype.hasOwnProperty.call(update, "accuracy_m")
+        ) {
+            const sighting = nextFields.wildlife_sightings.find((item) => item.sighting_id === sightingId);
+            const hasValidCoordinates = sighting?.latitude !== null && sighting?.latitude !== undefined &&
+                sighting.latitude >= -90 && sighting.latitude <= 90 &&
+                sighting.longitude !== null && sighting.longitude !== undefined &&
+                sighting.longitude >= -180 && sighting.longitude <= 180;
+            void persistPatrolLocalState(nextFields)
+                .then(() => hasValidCoordinates ? enqueueSavedPatrolMetadata() : undefined)
+                .catch((error: unknown) =>
+                    toast.error(error instanceof Error ? error.message : "Unable to save wildlife location locally."),
+                );
+        }
     };
 
     const queueWildlifePhotos = async (
         record: OfflineFieldRecord,
         reportMetadataReady = false,
-        sightingsSnapshot: WildlifeSighting[] = fields.wildlife_sightings,
+        retryFailedIdentification?: { sightingId: string; photoId: string },
     ) => {
         if (!offline.ownerId) return;
+        let authoritativeRecord = await persistOfflineFieldRecord(offline.ownerId, record);
         if (!reportMetadataReady) {
-            await persistPatrolMetadataBeforeWildlifeEvidence(offline.ownerId, record);
+            await enqueueOfflineFieldOperation(
+                offline.ownerId,
+                "PATROL_REPORT",
+                authoritativeRecord,
+                authoritativeRecord.serverId ? "UPDATE" : "CREATE",
+            );
         }
-        for (const sighting of sightingsSnapshot) {
-            for (const photo of sighting.photos) {
-                if (photo.evidence_id) {
-                    if (["PENDING", "FAILED"].includes(photo.identification.status)) {
+        authoritativeRecord = await getOfflineFormRecord(
+            offline.ownerId,
+            "PATROL_REPORT",
+            record.localId,
+        ) ?? authoritativeRecord;
+        const wildlifeSightings = Array.isArray(authoritativeRecord.payload.wildlife_sightings)
+            ? authoritativeRecord.payload.wildlife_sightings as WildlifeSighting[]
+            : [];
+        for (const sighting of wildlifeSightings) {
+            for (const photo of sighting.photos ?? []) {
+                authoritativeRecord = await getOfflineFormRecord(
+                    offline.ownerId,
+                    "PATROL_REPORT",
+                    record.localId,
+                ) ?? authoritativeRecord;
+                const latestSighting = (authoritativeRecord.payload.wildlife_sightings as WildlifeSighting[] | undefined)
+                    ?.find((item) => item.sighting_id === sighting.sighting_id);
+                const latestPhoto = latestSighting?.photos.find((item) => item.photo_id === photo.photo_id);
+                if (!latestPhoto) continue;
+                if (latestPhoto.evidence_id) {
+                    if (
+                        latestPhoto.identification.status === "PENDING" ||
+                        (
+                            latestPhoto.identification.status === "FAILED" &&
+                            retryFailedIdentification?.sightingId === sighting.sighting_id &&
+                            retryFailedIdentification.photoId === photo.photo_id
+                        )
+                    ) {
                         await enqueueOfflineWildlifeIdentification(
                             offline.ownerId,
-                            record,
-                            photo.evidence_id,
+                            authoritativeRecord,
+                            latestPhoto.evidence_id,
                             sighting.sighting_id,
                             photo.photo_id,
+                            Boolean(retryFailedIdentification),
                         );
                     }
+                    authoritativeRecord = await getOfflineFormRecord(
+                        offline.ownerId,
+                        "PATROL_REPORT",
+                        record.localId,
+                    ) ?? authoritativeRecord;
                     continue;
                 }
-                if (!photo.file) continue;
-                const file = photo.file instanceof File
-                    ? photo.file
-                    : new File([photo.file], photo.file_name, { type: photo.mime_type });
+                const currentPhoto = fieldsRef.current.wildlife_sightings
+                    .find((item) => item.sighting_id === sighting.sighting_id)
+                    ?.photos.find((item) => item.photo_id === photo.photo_id);
+                const photoFile = currentPhoto?.file ?? latestPhoto.file;
+                if (!photoFile) continue;
+                const file = photoFile instanceof File
+                    ? photoFile
+                    : new File([photoFile], latestPhoto.file_name, { type: latestPhoto.mime_type });
                 await enqueueOfflineEvidenceUpload(
                     offline.ownerId,
-                    record,
+                    authoritativeRecord,
                     file,
                     `Wildlife sighting ${sighting.sighting_id}`,
                     `wildlife:${sighting.sighting_id}:${photo.photo_id}`,
                     { sightingId: sighting.sighting_id, photoId: photo.photo_id },
                 );
+                authoritativeRecord = await getOfflineFormRecord(
+                    offline.ownerId,
+                    "PATROL_REPORT",
+                    record.localId,
+                ) ?? authoritativeRecord;
             }
         }
     };
@@ -853,13 +1140,6 @@ export function PatrolReportForm({
     };
 
     const saveDraft = async () => {
-        if (!isExtracted) {
-            toast.error(
-                "Please extract the patrol report first.",
-            );
-            return;
-        }
-
         if (isSubmitted) {
             toast.error(
                 "This patrol report has already been submitted.",
@@ -868,13 +1148,22 @@ export function PatrolReportForm({
         }
 
         setIsSaving(true);
+        reportSaveRequested.current = true;
 
         try {
+            const persistedRecord = await persistPatrolLocalState(fieldsRef.current);
+            const activeReportId = persistedRecord?.serverId ?? reportId;
+            const persistedFields = persistedRecord?.payload ?? fieldsRef.current;
+            const persistedSightings = Array.isArray(persistedFields.wildlife_sightings)
+                ? persistedFields.wildlife_sightings as WildlifeSighting[]
+                : fieldsRef.current.wildlife_sightings;
             const payload = {
-                ...fields,
-                wildlife_sightings: serializableWildlifeSightings(fields.wildlife_sightings),
+                ...persistedFields,
+                wildlife_sightings: serializableWildlifeSightings(persistedSightings),
 
-                team_members: fields.team_members
+                team_members: (Array.isArray(persistedFields.team_members)
+                    ? persistedFields.team_members as string[]
+                    : fieldsRef.current.team_members)
                     .map((member) => member.trim())
                     .filter(Boolean),
 
@@ -884,14 +1173,14 @@ export function PatrolReportForm({
                 ai_confidence: confidence,
             };
 
-            const isUpdating = Boolean(reportId);
+            const isUpdating = Boolean(activeReportId);
             const operationId = fieldCreateOperationId("PATROL_REPORT", localId.current || (localId.current = createFieldLocalId()));
-            if (offline.ownerId && (!navigator.onLine || (queuedCreate && !reportId))) {
+            if (offline.ownerId && (!navigator.onLine || (queuedCreate && !activeReportId))) {
                 const record: OfflineFieldRecord = {
                     ownerId: offline.ownerId,
                     module: "PATROL_REPORT",
                     localId: localId.current,
-                    serverId: reportId,
+                    serverId: activeReportId,
                     payload,
                     status: "DRAFT",
                     syncError: null,
@@ -901,10 +1190,10 @@ export function PatrolReportForm({
                     offline.ownerId,
                     "PATROL_REPORT",
                     record,
-                    reportId ? "UPDATE" : "CREATE",
+                    activeReportId ? "UPDATE" : "CREATE",
                 );
                 await queueWildlifePhotos(record, true);
-                if (!reportId) setQueuedCreate(true);
+                if (!activeReportId) setQueuedCreate(true);
                 toast.info("Patrol report draft is saved locally and will sync when the service is available.");
                 return;
             }
@@ -912,7 +1201,7 @@ export function PatrolReportForm({
             const result =
                 await apiRequest<PatrolReportSaveResponse>(
                     isUpdating
-                        ? `/api/v1/field/forms/patrol/${reportId}`
+                        ? `/api/v1/field/forms/patrol/${activeReportId}`
                         : "/api/v1/field/forms/patrol",
                     {
                         method: isUpdating
@@ -928,7 +1217,7 @@ export function PatrolReportForm({
                         ownerId: offline.ownerId,
                         module: "PATROL_REPORT",
                         localId: localId.current,
-                        serverId: reportId,
+                        serverId: activeReportId,
                         payload,
                         status: "DRAFT",
                         syncError: null,
@@ -1173,10 +1462,7 @@ export function PatrolReportForm({
     const textareaClassName =
         "min-h-[100px] w-full resize-y rounded-xl border border-border bg-background px-3 py-2.5 text-sm text-foreground outline-none transition placeholder:text-muted-foreground focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-60";
 
-    const formDisabled =
-        isSubmitted ||
-        isSaving ||
-        isSubmitting;
+    const formDisabled = isSubmitted;
 
     return (
         <section className="rounded-2xl border border-border bg-card text-card-foreground shadow-sm">
@@ -1812,6 +2098,9 @@ export function PatrolReportForm({
                                                             ? `${sighting.latitude.toFixed(6)}, ${sighting.longitude.toFixed(6)}`
                                                             : "Location not captured"}
                                                         {sighting.accuracy_m !== null && ` (accuracy ${Math.round(sighting.accuracy_m)} m)`}
+                                                        {sighting.location_capture_status === "GPS" && " · GPS"}
+                                                        {sighting.location_capture_status === "MANUAL" && " · Manual"}
+                                                        {sighting.location_capture_status === "UNAVAILABLE" && " · GPS unavailable"}
                                                     </div>
                                                     <button
                                                         type="button"
@@ -1894,7 +2183,7 @@ export function PatrolReportForm({
                                                                                     ? `Upload failed: ${photo.upload_error ?? "retry sync"}`
                                                                             : photo.identification.status === "FAILED"
                                                                                 ? `Identification failed: ${photo.identification.error ?? "try again"}`
-                                                                                : photo.evidence_id ? "Pending identification" : "Pending Sync"}
+                                                                                : photo.evidence_id ? "Pending identification" : "Saved Locally · Pending Upload"}
                                                                 </p>
                                                                 {photo.identification.common_name && (
                                                                     <p className="mt-1 text-sm font-semibold">
@@ -1929,7 +2218,7 @@ export function PatrolReportForm({
                                                                     </label>
                                                                 )}
                                                             </div>
-                                                            {photo.file && photo.identification.status !== "IDENTIFIED" && (
+                                                            {photo.evidence_id && photo.identification.status === "FAILED" && (
                                                                 <button
                                                                     type="button"
                                                                     onClick={async () => {
@@ -1939,15 +2228,18 @@ export function PatrolReportForm({
                                                                             localId: localId.current,
                                                                             serverId: reportId,
                                                                             payload: {
-                                                                                ...fields,
-                                                                                wildlife_sightings: serializableWildlifeSightings(fields.wildlife_sightings),
+                                                                                ...fieldsRef.current,
+                                                                                wildlife_sightings: serializableWildlifeSightings(fieldsRef.current.wildlife_sightings),
                                                                             },
                                                                             status: "DRAFT",
                                                                             syncError: null,
                                                                             updatedAt: new Date().toISOString(),
                                                                         };
                                                                         try {
-                                                                            await queueWildlifePhotos(record);
+                                                                            await queueWildlifePhotos(record, true, {
+                                                                                sightingId: sighting.sighting_id,
+                                                                                photoId: photo.photo_id,
+                                                                            });
                                                                             toast.info("Wildlife photo queued for upload and identification.");
                                                                         } catch (error) {
                                                                             toast.error(error instanceof Error ? error.message : "Unable to retry wildlife identification.");

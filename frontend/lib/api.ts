@@ -64,8 +64,20 @@ async function refreshAccessToken(): Promise<RefreshResult> {
 }
 
 function failureForStatus(status: number, body: any): ApiResponse<never> {
+  const detail = typeof body?.detail === "string"
+    ? body.detail
+    : Array.isArray(body?.detail)
+      ? body.detail.map((item: unknown) =>
+          typeof item === "string"
+            ? item
+            : item !== null && typeof item === "object" && "msg" in item
+              ? String(item.msg)
+              : JSON.stringify(item),
+        ).join("; ")
+      : undefined;
   const message =
     body?.message ??
+    detail ??
     (status === 401
       ? "Your session has expired. Please sign in again."
       : status === 403

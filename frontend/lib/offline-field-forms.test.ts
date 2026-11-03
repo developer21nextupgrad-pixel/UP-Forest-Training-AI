@@ -4,9 +4,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   enqueueOfflineFieldOperation,
   enqueueOfflineEvidenceUpload,
+  getOfflineFieldFormRecords,
   getOfflineFormRecord,
   getPendingFieldOperationCount,
   loadOfflineFormDraft,
+  persistOfflineFieldRecord,
   saveOfflineFormDraft,
   syncOfflineFieldFormQueue,
   type OfflineFieldRecord,
@@ -62,6 +64,25 @@ async function removeStoredOperationClientKey(
       transaction.oncomplete = () => resolve();
       transaction.onerror = () => reject(transaction.error);
       transaction.onabort = () => reject(transaction.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function getStoredOperation(operationId: string): Promise<Record<string, unknown> | undefined> {
+  const db = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open("up-forest-offline-field-forms", 1);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  try {
+    return await new Promise((resolve, reject) => {
+      const request = db.transaction("operations", "readonly")
+        .objectStore("operations")
+        .get([OWNER, "PATROL_REPORT", operationId]);
+      request.onsuccess = () => resolve(request.result as Record<string, unknown> | undefined);
+      request.onerror = () => reject(request.error);
     });
   } finally {
     db.close();
@@ -130,6 +151,205 @@ describe("Offline field form queue", () => {
     });
     expect(await loadOfflineFormDraft("another-officer", "PATROL_REPORT", "active")).toBeUndefined();
     expect(await loadOfflineFormDraft(OWNER, "INCIDENT_REPORT", "active")).toBeUndefined();
+  });
+
+  it("keeps per-report editor snapshots and local records isolated", async () => {
+    const secondRecord = { ...record, localId: "patrol-local-2", payload: { purpose: "Second route" } };
+    await saveOfflineFormDraft(OWNER, "PATROL_REPORT", `patrol:${record.localId}`, {
+      localId: record.localId,
+      fields: { purpose: "Track wildlife" },
+    });
+    await saveOfflineFormDraft(OWNER, "PATROL_REPORT", `patrol:${secondRecord.localId}`, {
+      localId: secondRecord.localId,
+      fields: { purpose: "Second route" },
+    });
+    await enqueueOfflineFieldOperation(OWNER, "PATROL_REPORT", record, "CREATE");
+    await enqueueOfflineFieldOperation(OWNER, "PATROL_REPORT", secondRecord, "CREATE");
+
+    expect(await loadOfflineFormDraft(OWNER, "PATROL_REPORT", `patrol:${record.localId}`))
+      .toMatchObject({ snapshot: { localId: record.localId, fields: { purpose: "Track wildlife" } } });
+    expect(await loadOfflineFormDraft(OWNER, "PATROL_REPORT", `patrol:${secondRecord.localId}`))
+      .toMatchObject({ snapshot: { localId: secondRecord.localId, fields: { purpose: "Second route" } } });
+    expect(await getOfflineFieldFormRecords(OWNER, "PATROL_REPORT"))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          localId: record.localId,
+          payload: expect.objectContaining({ purpose: "Track wildlife" }),
+        }),
+        expect.objectContaining({
+          localId: secondRecord.localId,
+          payload: expect.objectContaining({ purpose: "Second route" }),
+        }),
+      ]));
+  });
+
+  it("counts unique offline wildlife upload operations immediately and retains their Blobs", async () => {
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: { onLine: false },
+    });
+    const photos = ["photo-1", "photo-2"].map((photoId) => ({
+      photo_id: photoId,
+      file_name: `${photoId}.jpg`,
+      mime_type: "image/jpeg",
+      file_size: 5,
+      evidence_id: null,
+      identification: {
+        status: "PENDING" as const,
+        common_name: null,
+        scientific_name: null,
+        confidence: null,
+      },
+      upload_status: "PENDING" as const,
+    }));
+    const report: OfflineFieldRecord = {
+      ...record,
+      serverId: "patrol-server-1",
+      payload: {
+        ...record.payload,
+        wildlife_sightings: [{
+          sighting_id: "sighting-1",
+          common_name: "",
+          scientific_name: "",
+          manual_species_name: "",
+          latitude: 28.1,
+          longitude: 82.2,
+          accuracy_m: 7,
+          captured_at: "2026-11-03T10:00:00.000Z",
+          location_capture_status: "GPS",
+          photos,
+        }],
+      },
+    };
+
+    expect(await getPendingFieldOperationCount(OWNER, "PATROL_REPORT")).toBe(0);
+    for (const photo of photos) {
+      const image = new File([photo.photo_id], photo.file_name, { type: photo.mime_type });
+      await enqueueOfflineEvidenceUpload(
+        OWNER,
+        report,
+        image,
+        "Wildlife photo",
+        `wildlife:sighting-1:${photo.photo_id}`,
+        { sightingId: "sighting-1", photoId: photo.photo_id },
+      );
+    }
+
+    expect(await getPendingFieldOperationCount(OWNER, "PATROL_REPORT")).toBe(2);
+    expect(vi.mocked(globalThis.dispatchEvent).mock.calls.some(([event]) =>
+      event instanceof Event && event.type === "up-forest-offline-queue-changed",
+    )).toBe(true);
+    const firstOperation = await getStoredOperation(
+      `evidence:${record.localId}:wildlife:sighting-1:photo-1`,
+    );
+    expect(firstOperation).toMatchObject({
+      localId: record.localId,
+      kind: "EVIDENCE_UPLOAD",
+      status: "PENDING",
+      file: {
+        fileName: "photo-1.jpg",
+        mimeType: "image/jpeg",
+        wildlifeSightingId: "sighting-1",
+        wildlifePhotoId: "photo-1",
+        wildlifePhotoMetadata: { photo_id: "photo-1" },
+      },
+    });
+    const retainedBlob = (firstOperation?.file as { blob?: Blob } | undefined)?.blob;
+    expect(await retainedBlob?.text()).toBe("photo-1");
+
+    await enqueueOfflineEvidenceUpload(
+      OWNER,
+      report,
+      new File(["replacement"], "photo-1.jpg", { type: "image/jpeg" }),
+      "Wildlife photo",
+      "wildlife:sighting-1:photo-1",
+      { sightingId: "sighting-1", photoId: "photo-1" },
+    );
+    expect(await getPendingFieldOperationCount(OWNER, "PATROL_REPORT")).toBe(2);
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("up-forest-offline-field-forms", 1);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const transaction = db.transaction("operations", "readwrite");
+        const store = transaction.objectStore("operations");
+        const request = store.get([
+          OWNER,
+          "PATROL_REPORT",
+          `evidence:${record.localId}:wildlife:sighting-1:photo-1`,
+        ]);
+        request.onsuccess = () => {
+          store.put({ ...request.result, status: "FAILED", error: "Upload rejected." });
+        };
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(transaction.error);
+        transaction.onabort = () => reject(transaction.error);
+      });
+    } finally {
+      db.close();
+    }
+    expect(await getPendingFieldOperationCount(OWNER, "PATROL_REPORT")).toBe(2);
+  });
+
+  it("keeps saved GPS coordinates when a stale offline report update has empty location fields", async () => {
+    const saved: OfflineFieldRecord = {
+      ...record,
+      payload: {
+        ...record.payload,
+        wildlife_sightings: [{
+          sighting_id: "sighting-gps",
+          latitude: 28.1,
+          longitude: 82.2,
+          accuracy_m: 7,
+          captured_at: "2026-11-03T10:00:00.000Z",
+          location_capture_status: "GPS",
+          photos: [],
+        }],
+      },
+    };
+    const stale: OfflineFieldRecord = {
+      ...saved,
+      payload: {
+        ...saved.payload,
+        wildlife_sightings: [{
+          sighting_id: "sighting-gps",
+          latitude: null,
+          longitude: null,
+          accuracy_m: null,
+          captured_at: null,
+          location_capture_status: "UNAVAILABLE",
+          photos: [],
+        }],
+      },
+    };
+
+    await persistOfflineFieldRecord(OWNER, saved);
+    await enqueueOfflineFieldOperation(OWNER, "PATROL_REPORT", stale, "UPDATE");
+
+    expect(await getOfflineFormRecord(OWNER, "PATROL_REPORT", record.localId))
+      .toMatchObject({
+        payload: {
+          wildlife_sightings: [{
+            latitude: 28.1,
+            longitude: 82.2,
+            accuracy_m: 7,
+            location_capture_status: "GPS",
+          }],
+        },
+      });
+    expect(await getStoredOperation(`update:patrol_report:${record.localId}`))
+      .toMatchObject({
+        payload: {
+          wildlife_sightings: [{
+            latitude: 28.1,
+            longitude: 82.2,
+            accuracy_m: 7,
+            location_capture_status: "GPS",
+          }],
+        },
+      });
   });
 
   it("deduplicates queued create operations and stores the confirmed server ID", async () => {
