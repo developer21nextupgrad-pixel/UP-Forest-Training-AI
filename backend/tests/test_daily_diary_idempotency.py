@@ -20,6 +20,7 @@ from app.api.field import (
     submit_patrol_report,
     upload_evidence,
 )
+from app.core.config import Settings
 from app.models import (
     DailyDiary,
     Evidence,
@@ -353,6 +354,7 @@ async def test_evidence_upload_retry_with_same_operation_id_does_not_duplicate_f
 
         async def upload():
             return await upload_evidence(
+                settings=Settings(_env_file=None),
                 report_type="OFFENCE_SEIZURE",
                 report_id=report.id,
                 file=UploadFile(

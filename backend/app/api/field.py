@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 
-
+import asyncio
 import logging
 import uuid
 
@@ -30,7 +30,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import require_field_officer
 
-from app.core.config import SettingsDep, get_settings
+from app.core.config import Settings, SettingsDep, get_settings
+from app.core.evidence_storage import (
+    EvidenceStorageError,
+    prepare_evidence_storage,
+    resolve_evidence_storage_path,
+)
 
 from app.db.session import get_db_session
 
@@ -145,9 +150,87 @@ from app.services.field_forms import (
 
 logger = logging.getLogger(__name__)
 
-
-
 router = APIRouter(prefix="/field", tags=["field"])
+
+
+def _resolve_evidence_path(storage_key: str, settings: Settings) -> Path:
+    try:
+        return resolve_evidence_storage_path(storage_key, settings)
+    except EvidenceStorageError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Evidence file is not available.",
+        ) from exc
+
+
+async def _cleanup_deleted_evidence_file(
+    *,
+    evidence_id: UUID,
+    storage_key: str,
+    storage_path: Path,
+    settings: Settings,
+    session: AsyncSession,
+) -> tuple[bool, bool]:
+    try:
+        active_storage_keys = await session.scalars(select(Evidence.storage_key))
+        for active_storage_key in active_storage_keys:
+            if active_storage_key == storage_key:
+                logger.warning(
+                    "Retaining evidence file referenced by an active record: "
+                    "evidence_id=%s storage_key=%s",
+                    evidence_id,
+                    storage_key,
+                )
+                return False, True
+            try:
+                active_path = resolve_evidence_storage_path(
+                    active_storage_key,
+                    settings,
+                )
+            except EvidenceStorageError:
+                logger.exception(
+                    "Cannot safely verify active evidence path; retaining file: "
+                    "evidence_id=%s storage_key=%s active_storage_key=%s",
+                    evidence_id,
+                    storage_key,
+                    active_storage_key,
+                )
+                return False, True
+            if active_path == storage_path:
+                logger.warning(
+                    "Retaining evidence file referenced by another active record: "
+                    "evidence_id=%s storage_key=%s active_storage_key=%s",
+                    evidence_id,
+                    storage_key,
+                    active_storage_key,
+                )
+                return False, True
+    except Exception:
+        logger.exception(
+            "Unable to verify evidence file references; cleanup deferred: "
+            "evidence_id=%s storage_key=%s",
+            evidence_id,
+            storage_key,
+        )
+        return True, False
+
+    for attempt in range(1, 4):
+        try:
+            storage_path.unlink()
+            return False, False
+        except FileNotFoundError:
+            return False, False
+        except OSError:
+            logger.exception(
+                "Failed to delete evidence file: evidence_id=%s storage_key=%s "
+                "attempt=%s",
+                evidence_id,
+                storage_key,
+                attempt,
+            )
+            if attempt < 3:
+                await asyncio.sleep(0.05 * attempt)
+    return True, False
 
 
 
@@ -3027,6 +3110,7 @@ async def update_patrol_report_draft(
 
 @router.post("/evidence/upload")
 async def upload_evidence(
+    settings: SettingsDep,
     report_type: str = Form(...),
     report_id: UUID = Form(...),
     file: UploadFile = File(...),
@@ -3314,11 +3398,18 @@ async def upload_evidence(
     # Never use the original filename as the storage filename.
     # ---------------------------------------------------------
 
-    storage_dir = Path("uploads") / "evidence"
-    storage_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        storage_dir = prepare_evidence_storage(settings)
+    except EvidenceStorageError as exc:
+        logger.exception("Configured evidence storage is unavailable.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Evidence storage is unavailable. Please retry later.",
+        ) from exc
 
     storage_filename = f"{UUID(int=uuid.uuid4().int).hex}{extension}"
     storage_path = storage_dir / storage_filename
+    storage_key = (Path("evidence") / storage_filename).as_posix()
 
     try:
         storage_path.write_bytes(file_content)
@@ -3329,7 +3420,7 @@ async def upload_evidence(
             officer_id=user.id,
             client_operation_id=client_operation_id,
             file_name=original_filename,
-            storage_key=str(storage_path),
+            storage_key=storage_key,
             file_type=extension.lstrip("."),
             file_size=len(file_content),
             mime_type=expected_mime_type,
@@ -3430,6 +3521,7 @@ async def upload_evidence(
 
 @router.post("/forms/patrol/{report_id}/wildlife-identify")
 async def identify_patrol_wildlife_photo(
+    settings: SettingsDep,
     report_id: UUID,
     evidence_id: UUID = Form(...),
     wildlife_sighting_id: str = Form(..., max_length=100),
@@ -3475,7 +3567,7 @@ async def identify_patrol_wildlife_photo(
     if target_photo is None or target_photo.get("evidence_id") != str(evidence.id):
         raise HTTPException(status_code=400, detail="The wildlife photo is not associated with this Patrol Report sighting.")
 
-    storage_path = Path(evidence.storage_key)
+    storage_path = _resolve_evidence_path(evidence.storage_key, settings)
     if not storage_path.is_file():
         raise HTTPException(status_code=404, detail="Wildlife photo file is not available.")
 
@@ -3566,6 +3658,7 @@ async def identify_patrol_wildlife_photo(
 @router.get("/evidence/{evidence_id}/file")
 async def get_evidence_file(
     evidence_id: UUID,
+    settings: SettingsDep,
     user: User = Depends(require_field_officer),
     session: AsyncSession = Depends(get_db_session),
 ):
@@ -3588,7 +3681,8 @@ async def get_evidence_file(
             detail="Evidence not found or you do not have access to it.",
         )
 
-    storage_path = Path(evidence.storage_key)
+    storage_key = evidence.storage_key
+    storage_path = _resolve_evidence_path(storage_key, settings)
 
     if not storage_path.exists() or not storage_path.is_file():
         raise HTTPException(
@@ -3605,6 +3699,7 @@ async def get_evidence_file(
 @router.delete("/evidence/{evidence_id}")
 async def delete_evidence(
     evidence_id: UUID,
+    settings: SettingsDep,
     user: User = Depends(require_field_officer),
     session: AsyncSession = Depends(get_db_session),
 ):
@@ -3623,7 +3718,8 @@ async def delete_evidence(
             detail="Evidence not found or you do not have access to it.",
         )
 
-    storage_path = Path(evidence.storage_key)
+    storage_key = evidence.storage_key
+    storage_path = _resolve_evidence_path(storage_key, settings)
 
     try:
         if evidence.report_type == "PATROL":
@@ -3656,19 +3752,25 @@ async def delete_evidence(
             detail="Unable to delete evidence.",
         )
 
-    if storage_path.exists() and storage_path.is_file():
-        try:
-            storage_path.unlink()
-        except OSError:
-            logger.exception(
-                "Failed to delete evidence file from storage: %s",
-                storage_path,
-            )
+    cleanup_pending, file_retained = await _cleanup_deleted_evidence_file(
+        evidence_id=evidence_id,
+        storage_key=storage_key,
+        storage_path=storage_path,
+        settings=settings,
+        session=session,
+    )
 
     return {
         "success": True,
         "evidence_id": str(evidence_id),
-        "message": "Evidence deleted successfully.",
+        "message": (
+            "Evidence record deleted; physical file cleanup is pending."
+            if cleanup_pending
+            else "Evidence record deleted; the shared file was retained."
+            if file_retained
+            else "Evidence deleted successfully."
+        ),
+        "physical_file_cleanup_pending": cleanup_pending,
     }      
     
 @router.get("/evidence/{report_type}/{report_id}")

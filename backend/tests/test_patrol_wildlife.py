@@ -1,3 +1,4 @@
+from pathlib import Path
 from io import BytesIO
 from uuid import UUID, uuid4
 
@@ -12,12 +13,14 @@ from starlette.datastructures import Headers, UploadFile
 
 from app.api.field import (
     delete_evidence,
+    get_evidence_file,
     identify_patrol_wildlife_photo,
     list_patrol_report_drafts,
     save_patrol_report_draft,
     update_patrol_report_draft,
     upload_evidence,
 )
+from app.core.config import Settings
 from app.models import Evidence, FieldPatrolReport, User, UserRole
 from app.schemas.field_forms import PatrolReportSaveRequest
 
@@ -26,6 +29,7 @@ from app.schemas.field_forms import PatrolReportSaveRequest
 async def test_patrol_wildlife_upload_idempotency_ownership_and_identification(
     tmp_path,
     monkeypatch,
+    caplog,
 ):
     monkeypatch.chdir(tmp_path)
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -35,6 +39,7 @@ async def test_patrol_wildlife_upload_idempotency_ownership_and_identification(
         await connection.run_sync(Evidence.__table__.create)
 
     sessions = async_sessionmaker(engine, expire_on_commit=False)
+    settings = Settings(_env_file=None, upload_dir=tmp_path / "configured-uploads")
     image_buffer = BytesIO()
     Image.new("RGB", (120, 120), color="forestgreen").save(image_buffer, format="JPEG")
     image_content = image_buffer.getvalue()
@@ -99,6 +104,7 @@ async def test_patrol_wildlife_upload_idempotency_ownership_and_identification(
             operation_id=None,
         ):
             return await upload_evidence(
+                settings=settings,
                 report_type="PATROL",
                 report_id=target_report_id,
                 file=UploadFile(
@@ -120,6 +126,32 @@ async def test_patrol_wildlife_upload_idempotency_ownership_and_identification(
         retry_upload = await upload()
         assert retry_upload["evidence"]["id"] == first_upload["evidence"]["id"]
         assert await session.scalar(select(func.count()).select_from(Evidence)) == 1
+        uploaded_evidence = await session.get(Evidence, UUID(first_upload["evidence"]["id"]))
+        assert uploaded_evidence.storage_key.startswith("evidence/")
+        configured_file = settings.upload_dir / uploaded_evidence.storage_key
+        assert configured_file.read_bytes() == image_content
+
+        file_response = await get_evidence_file(
+            evidence_id=UUID(first_upload["evidence"]["id"]),
+            settings=settings,
+            user=officer,
+            session=session,
+        )
+        assert Path(file_response.path).read_bytes() == image_content
+
+        legacy_file = tmp_path / "uploads" / "evidence" / "legacy-photo.jpg"
+        legacy_file.parent.mkdir(parents=True)
+        legacy_file.write_bytes(image_content)
+        uploaded_evidence.storage_key = "uploads/evidence/legacy-photo.jpg"
+        await session.commit()
+        legacy_response = await get_evidence_file(
+            evidence_id=UUID(first_upload["evidence"]["id"]),
+            settings=settings,
+            user=officer,
+            session=session,
+        )
+        assert Path(legacy_response.path).read_bytes() == image_content
+
         stored = await session.get(FieldPatrolReport, report_id)
         stored_sightings = [dict(item) for item in stored.wildlife_sightings]
         stored_sightings[0]["photos"][0]["evidence_id"] = None
@@ -182,8 +214,34 @@ async def test_patrol_wildlife_upload_idempotency_ownership_and_identification(
             await upload(target_photo_id=uuid4())
         assert invalid_photo.value.status_code == 400
 
+        blocked_storage = tmp_path / "blocked-storage"
+        blocked_storage.write_text("not a directory", encoding="utf-8")
+        with pytest.raises(HTTPException) as unavailable_storage:
+            await upload_evidence(
+                settings=Settings(_env_file=None, upload_dir=blocked_storage),
+                report_type="PATROL",
+                report_id=report_id,
+                file=UploadFile(
+                    filename="wildlife.jpg",
+                    file=BytesIO(image_content),
+                    headers=Headers({"content-type": "image/jpeg"}),
+                ),
+                description=None,
+                client_operation_id=f"wildlife:{sighting_id}:{second_photo_id}",
+                wildlife_sighting_id=str(sighting_id),
+                wildlife_photo_id=str(second_photo_id),
+                user=officer,
+                session=session,
+            )
+        assert unavailable_storage.value.status_code == 503
+
         raced_evidence_id = uuid4()
         race_operation_id = f"wildlife:{sighting_id}:{second_photo_id}"
+        legacy_absolute_file = (
+            tmp_path / "uploads" / "evidence" / "existing-evidence.jpg"
+        )
+        legacy_absolute_file.parent.mkdir(parents=True, exist_ok=True)
+        legacy_absolute_file.write_bytes(image_content)
         async with sessions() as racing_session:
             racing_session.add(Evidence(
                 id=raced_evidence_id,
@@ -192,7 +250,7 @@ async def test_patrol_wildlife_upload_idempotency_ownership_and_identification(
                 officer_id=officer.id,
                 client_operation_id=race_operation_id,
                 file_name="second.jpg",
-                storage_key=str(tmp_path / "existing-evidence.jpg"),
+                storage_key=str(legacy_absolute_file),
                 file_type="jpg",
                 file_size=len(image_content),
                 mime_type="image/jpeg",
@@ -234,6 +292,7 @@ async def test_patrol_wildlife_upload_idempotency_ownership_and_identification(
             FakeSpeciesIdentificationService,
         )
         identification = await identify_patrol_wildlife_photo(
+            settings=settings,
             report_id=report_id,
             evidence_id=UUID(first_upload["evidence"]["id"]),
             wildlife_sighting_id=str(sighting_id),
@@ -253,28 +312,76 @@ async def test_patrol_wildlife_upload_idempotency_ownership_and_identification(
 
         deletion = await delete_evidence(
             evidence_id=UUID(first_upload["evidence"]["id"]),
+            settings=settings,
             user=officer,
             session=session,
         )
         assert deletion["success"] is True
+        assert deletion["physical_file_cleanup_pending"] is False
+        assert not legacy_file.exists()
         assert await session.scalar(select(func.count()).select_from(Evidence)) == 1
         stored = await session.get(FieldPatrolReport, report_id)
         assert (
             stored.wildlife_sightings[0]["photos"][0]["photo_id"]
             == str(second_photo_id)
         )
+        legacy_absolute_file.unlink()
         second_deletion = await delete_evidence(
             evidence_id=raced_evidence_id,
+            settings=settings,
             user=officer,
             session=session,
         )
         assert second_deletion["success"] is True
+        assert second_deletion["physical_file_cleanup_pending"] is False
         assert await session.scalar(select(func.count()).select_from(Evidence)) == 0
         stored = await session.get(FieldPatrolReport, report_id)
         assert stored.wildlife_sightings[0]["photos"] == []
 
+        failed_cleanup_id = uuid4()
+        failed_cleanup_file = tmp_path / "uploads" / "evidence" / "cleanup-failure.jpg"
+        failed_cleanup_file.write_bytes(image_content)
+        session.add(Evidence(
+            id=failed_cleanup_id,
+            report_type="PATROL",
+            report_id=report_id,
+            officer_id=officer.id,
+            file_name="cleanup-failure.jpg",
+            storage_key="uploads/evidence/cleanup-failure.jpg",
+            file_type="jpg",
+            file_size=len(image_content),
+            mime_type="image/jpeg",
+        ))
+        await session.commit()
+
+        original_unlink = Path.unlink
+
+        def fail_cleanup(path, *args, **kwargs):
+            if path == failed_cleanup_file:
+                raise PermissionError("simulated storage permission failure")
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", fail_cleanup)
+        caplog.set_level("ERROR", logger="app.api.field")
+        failed_deletion = await delete_evidence(
+            evidence_id=failed_cleanup_id,
+            settings=settings,
+            user=officer,
+            session=session,
+        )
+        monkeypatch.setattr(Path, "unlink", original_unlink)
+
+        assert failed_deletion["success"] is True
+        assert failed_deletion["physical_file_cleanup_pending"] is True
+        assert "cleanup is pending" in failed_deletion["message"]
+        assert not await session.get(Evidence, failed_cleanup_id)
+        assert failed_cleanup_file.exists()
+        assert str(failed_cleanup_id) in caplog.text
+        assert "uploads/evidence/cleanup-failure.jpg" in caplog.text
+
         with pytest.raises(HTTPException) as unauthorized:
             await identify_patrol_wildlife_photo(
+                settings=settings,
                 report_id=report_id,
                 evidence_id=UUID(first_upload["evidence"]["id"]),
                 wildlife_sighting_id=str(sighting_id),

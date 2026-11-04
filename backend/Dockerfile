@@ -12,7 +12,8 @@ COPY alembic ./alembic
 
 RUN pip install --no-cache-dir .
 
-RUN useradd --create-home --shell /bin/bash appuser
+RUN useradd --create-home --shell /bin/bash appuser \
+    && install -d -o appuser -g appuser /app/uploads/evidence /var/data/uploads/evidence
 USER appuser
 
 EXPOSE 8000

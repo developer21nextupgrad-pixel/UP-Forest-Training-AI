@@ -6,8 +6,6 @@ from uuid import UUID
 
 from typing import Literal
 
-from pathlib import Path
-
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -21,7 +19,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import require_admin
-
+from app.core.config import SettingsDep
+from app.core.evidence_storage import EvidenceStorageError, resolve_evidence_storage_path
 from app.core.security import hash_password
 
 from app.db.session import get_db_session
@@ -1022,6 +1021,7 @@ async def list_offence_seizure_evidence(
 )
 async def get_admin_offence_seizure_evidence_file(
     evidence_id: UUID,
+    settings: SettingsDep,
     _: User = Depends(require_admin),
     session: AsyncSession = Depends(get_db_session),
 ):
@@ -1039,7 +1039,13 @@ async def get_admin_offence_seizure_evidence_file(
             detail="Invalid evidence report type.",
         )
 
-    storage_path = Path(evidence.storage_key)
+    try:
+        storage_path = resolve_evidence_storage_path(evidence.storage_key, settings)
+    except EvidenceStorageError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail="Evidence file is missing from storage.",
+        ) from exc
 
     if not storage_path.exists() or not storage_path.is_file():
         raise HTTPException(

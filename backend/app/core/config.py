@@ -8,6 +8,7 @@ via ``pydantic-settings``. Nothing in ``services/`` or ``api/`` should read
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, Literal
 
 from fastapi import Depends
@@ -30,6 +31,7 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = 7
     password_reset_expire_minutes: int = 60
     frontend_base_url: str = "http://localhost:3000"
+    upload_dir: Path = Path("uploads")
 
     # Optional SMTP delivery for password-reset emails. Local development can
     # use the debug reset URL returned by the reset-request endpoint.
@@ -248,6 +250,8 @@ class Settings(BaseSettings):
             raise ValueError("MISTRAL retry base must be positive")
         if self.environment == "production" and self.vector_store != "pgvector":
             raise ValueError("Production environments must use pgvector")
+        if self.environment == "production" and not self.upload_dir.is_absolute():
+            raise ValueError("Production UPLOAD_DIR must be an absolute writable path")
         return self
 
     @property

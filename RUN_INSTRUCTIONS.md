@@ -125,7 +125,15 @@ The backend currently supports Meta webhook verification and receive-only event 
 
 Configure the Meta callback URL as `https://up-forest-training-ai.onrender.com/api/v1/whatsapp/webhook`, enter the same `WHATSAPP_VERIFY_TOKEN` in Meta, and subscribe to the `messages` field. `GET /api/v1/whatsapp/webhook` returns the challenge only for a matching subscription verification token. `POST` verifies the HMAC signature over the exact request bytes, validates the event envelope, and logs only event type/count metadata. It does not store or inspect message content, pair accounts, call AI, or send messages. Configure the environment variables in Render and trigger a normal deploy/redeploy; no production environment values are changed by this code.
 
-## 14. Troubleshooting
+## 14. Persistent evidence storage on Render
+
+Evidence image bytes are stored on the backend filesystem; the database stores a storage key and file metadata, not the image itself. Container filesystems are ephemeral, so production evidence requires a Render Persistent Disk.
+
+In the Render dashboard, create and attach a Persistent Disk to the backend web service with mount path `/var/data`. Set the backend service environment variable `UPLOAD_DIR=/var/data/uploads`. The application stores new evidence under `/var/data/uploads/evidence`; `UPLOAD_DIR` must be an absolute writable directory in production. The Docker image prepares the corresponding directories for `appuser` without granting world-write permissions. Confirm the attached disk permits writes by the service user before considering the storage deployment ready.
+
+This repository has no Render service manifest, and this code change does not create or attach a production disk or change production environment values. Existing database records with legacy `uploads/evidence/...` storage keys remain resolved against the application working directory; new records use the configured upload root.
+
+## 15. Troubleshooting
 - **`vector` extension missing:** use `pgvector/pgvector:pg16` or install pgvector in your PostgreSQL server, then rerun `alembic upgrade head`.
 - **Mistral 429:** the app applies bounded concurrency, Retry-After, exponential backoff and jitter. Check worker/API logs.
 - **No chapters:** verify OCR quality and that the source actually contains explicit chapter markers; the system intentionally avoids inventing chapters.
