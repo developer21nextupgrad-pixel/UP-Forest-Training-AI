@@ -1465,7 +1465,10 @@ export function PatrolReportForm({
     const formDisabled = isSubmitted;
 
     return (
-        <section className="rounded-2xl border border-border bg-card text-card-foreground shadow-sm">
+        <section
+            id="patrol-report-form"
+            className="rounded-2xl border border-border bg-card text-card-foreground shadow-sm"
+        >
             <div className="border-b border-border px-5 py-3">
                 <OfflineFieldFormControls {...offline} />
             </div>
